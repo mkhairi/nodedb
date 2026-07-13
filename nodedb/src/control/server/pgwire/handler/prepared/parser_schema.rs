@@ -73,6 +73,13 @@ pub(super) fn is_dsl_statement(sql: &str) -> bool {
     {
         return true;
     }
+    // Session commands are handled by the session router (`handle_set` /
+    // session SHOW), not the SQL planner. libpq-based clients (e.g. Diesel)
+    // send `SET ...` through the extended-query protocol during connection
+    // setup, so they must passthrough here exactly like the simple-query path.
+    if upper.starts_with("SET ") || upper.starts_with("RESET ") {
+        return true;
+    }
     upper.starts_with("SEARCH ")
         || upper.starts_with("GRAPH ")
         || upper.starts_with("MATCH ")
