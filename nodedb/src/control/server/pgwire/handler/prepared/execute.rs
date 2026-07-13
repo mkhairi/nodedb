@@ -155,10 +155,12 @@ impl NodeDbPgHandler {
 /// Uses per-parameter format codes from the pgwire 0.38 `Format` API to determine
 /// whether each parameter was sent in text or binary format.
 ///
-/// Binary-format NUMERIC, TIMESTAMP, and TIMESTAMPTZ parameters are explicitly
-/// rejected with SQLSTATE 0A000 — their binary encodings are client-library-specific
-/// structs that would produce corrupt values if decoded naively. Clients must use
-/// text format for these types.
+/// Binary-format parameters with a portable protocol-defined encoding (bool,
+/// integers, floats, string types) are decoded natively; the rest (NUMERIC,
+/// TIMESTAMP[TZ], DATE, UUID, JSON, arrays) are rejected with SQLSTATE 0A000 —
+/// their binary encodings are client-library-specific or unimplemented and
+/// would produce corrupt values if decoded naively. Clients must use text
+/// format for those types.
 fn convert_portal_params(
     params: &[Option<Bytes>],
     param_types: &[Option<Type>],
@@ -174,29 +176,15 @@ fn convert_portal_params(
         let pv = match param {
             None => nodedb_sql::ParamValue::Null,
             Some(bytes) => {
-                // Reject binary format for types whose binary encoding is
-                // client-library-specific and cannot be decoded portably.
                 if param_format.is_binary(i) {
-                    let type_name = if *pg_type == Type::NUMERIC {
-                        Some("NUMERIC")
-                    } else if *pg_type == Type::TIMESTAMP {
-                        Some("TIMESTAMP")
-                    } else if *pg_type == Type::TIMESTAMPTZ {
-                        Some("TIMESTAMPTZ")
-                    } else {
-                        None
-                    };
-                    if let Some(name) = type_name {
-                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_owned(),
-                            "0A000".to_owned(),
-                            format!(
-                                "binary {name} parameter format is not supported for \
-                                 parameter ${n}; use text format",
-                                n = i + 1
-                            ),
-                        ))));
-                    }
+                    // Scalar types with a portable, PostgreSQL-documented
+                    // binary wire encoding are decoded natively — libpq-based
+                    // clients (e.g. Diesel) send every parameter in binary
+                    // format. Types whose binary encoding is
+                    // client-library-specific (NUMERIC, TIMESTAMP[TZ]) or not
+                    // yet implemented are rejected with 0A000.
+                    result.push(pgwire_binary_to_param(bytes, pg_type, i)?);
+                    continue;
                 }
 
                 let text = std::str::from_utf8(bytes).map_err(|_| {
@@ -213,6 +201,86 @@ fn convert_portal_params(
         result.push(pv);
     }
     Ok(result)
+}
+
+/// Decode a binary-format pgwire parameter into a typed `ParamValue`.
+///
+/// Covers the scalar types whose binary encoding is fixed by the PostgreSQL
+/// protocol documentation: network-byte-order integers and IEEE-754 floats,
+/// single-byte bool, and raw-UTF-8 text types. Everything else — NUMERIC,
+/// TIMESTAMP[TZ], DATE, UUID, JSON, arrays — is rejected with SQLSTATE 0A000
+/// so the client can fall back to text format, rather than being decoded
+/// naively into a corrupt value.
+fn pgwire_binary_to_param(
+    bytes: &Bytes,
+    pg_type: &Type,
+    index: usize,
+) -> PgWireResult<nodedb_sql::ParamValue> {
+    fn bad_len(ty: &Type, index: usize, want: usize, got: usize) -> PgWireError {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "22P03".to_owned(),
+            format!(
+                "invalid binary {} parameter ${}: expected {want} bytes, got {got}",
+                ty.name(),
+                index + 1
+            ),
+        )))
+    }
+
+    let b: &[u8] = bytes.as_ref();
+    let pv = match *pg_type {
+        Type::BOOL => {
+            let [v] = *b else {
+                return Err(bad_len(pg_type, index, 1, b.len()));
+            };
+            nodedb_sql::ParamValue::Bool(v != 0)
+        }
+        Type::INT2 => {
+            let arr: [u8; 2] = b.try_into().map_err(|_| bad_len(pg_type, index, 2, b.len()))?;
+            nodedb_sql::ParamValue::Int64(i16::from_be_bytes(arr) as i64)
+        }
+        Type::INT4 => {
+            let arr: [u8; 4] = b.try_into().map_err(|_| bad_len(pg_type, index, 4, b.len()))?;
+            nodedb_sql::ParamValue::Int64(i32::from_be_bytes(arr) as i64)
+        }
+        Type::INT8 => {
+            let arr: [u8; 8] = b.try_into().map_err(|_| bad_len(pg_type, index, 8, b.len()))?;
+            nodedb_sql::ParamValue::Int64(i64::from_be_bytes(arr))
+        }
+        Type::FLOAT4 => {
+            let arr: [u8; 4] = b.try_into().map_err(|_| bad_len(pg_type, index, 4, b.len()))?;
+            nodedb_sql::ParamValue::Float64(f32::from_be_bytes(arr) as f64)
+        }
+        Type::FLOAT8 => {
+            let arr: [u8; 8] = b.try_into().map_err(|_| bad_len(pg_type, index, 8, b.len()))?;
+            nodedb_sql::ParamValue::Float64(f64::from_be_bytes(arr))
+        }
+        // The binary encoding of the string types is the raw UTF-8 text.
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
+            let text = std::str::from_utf8(b).map_err(|_| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22021".to_owned(),
+                    format!("invalid UTF-8 in parameter ${}", index + 1),
+                )))
+            })?;
+            nodedb_sql::ParamValue::Text(text.to_string())
+        }
+        ref other => {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "0A000".to_owned(),
+                format!(
+                    "binary {} parameter format is not supported for parameter ${}; \
+                     use text format",
+                    other.name(),
+                    index + 1
+                ),
+            ))));
+        }
+    };
+    Ok(pv)
 }
 
 /// Convert a pgwire text parameter + declared type to a typed
@@ -318,6 +386,40 @@ mod tests {
 
     fn binary_format() -> Format {
         Format::UnifiedBinary
+    }
+
+    #[test]
+    fn convert_binary_scalar_params() {
+        let params = vec![
+            Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x2A])), // int4 42
+            Some(Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])), // int8 -1
+            Some(Bytes::from_static(&[0x01])),                   // bool true
+            Some(Bytes::from_static(b"hello")),                  // text
+            Some(Bytes::from_static(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18])), // f64 pi
+        ];
+        let types = vec![
+            Some(Type::INT4),
+            Some(Type::INT8),
+            Some(Type::BOOL),
+            Some(Type::TEXT),
+            Some(Type::FLOAT8),
+        ];
+        let result = convert_portal_params(&params, &types, &binary_format()).unwrap();
+        assert!(matches!(result[0], nodedb_sql::ParamValue::Int64(42)));
+        assert!(matches!(result[1], nodedb_sql::ParamValue::Int64(-1)));
+        assert!(matches!(result[2], nodedb_sql::ParamValue::Bool(true)));
+        assert!(matches!(&result[3], nodedb_sql::ParamValue::Text(s) if s == "hello"));
+        assert!(
+            matches!(result[4], nodedb_sql::ParamValue::Float64(f) if (f - std::f64::consts::PI).abs() < 1e-12)
+        );
+    }
+
+    #[test]
+    fn convert_binary_int4_wrong_length_errors() {
+        let params = vec![Some(Bytes::from_static(&[0x00, 0x2A]))];
+        let types = vec![Some(Type::INT4)];
+        let err = convert_portal_params(&params, &types, &binary_format()).unwrap_err();
+        assert!(err.to_string().contains("expected 4 bytes"), "{err}");
     }
 
     #[test]
