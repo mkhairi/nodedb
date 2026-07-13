@@ -54,6 +54,21 @@ pub fn parse_set_command(sql: &str) -> Option<(String, String)> {
 
     let rest = rest.trim();
 
+    // PostgreSQL special form: `SET [SESSION|LOCAL] TIME ZONE <value>` is
+    // equivalent to `SET timezone TO <value>`. libpq-based clients (e.g.
+    // Diesel) send this on every connection setup.
+    let upper_rest = rest.to_uppercase();
+    if let Some(tz_value) = upper_rest
+        .starts_with("TIME ZONE ")
+        .then(|| rest[10..].trim())
+    {
+        if tz_value.is_empty() {
+            return None;
+        }
+        let value = tz_value.trim_matches('\'').trim_matches('"').to_string();
+        return Some(("timezone".to_string(), value));
+    }
+
     // Split on = or TO.
     let (key, value) = if let Some(eq_pos) = rest.find('=') {
         let k = rest[..eq_pos].trim();
@@ -265,6 +280,23 @@ mod tests {
         let (k, v) = parse_set_command("SET nodedb.tenant_id = 5").unwrap();
         assert_eq!(k, "nodedb.tenant_id");
         assert_eq!(v, "5");
+    }
+
+    #[test]
+    fn parse_set_time_zone() {
+        let (k, v) = parse_set_command("SET TIME ZONE 'UTC'").unwrap();
+        assert_eq!(k, "timezone");
+        assert_eq!(v, "UTC");
+
+        let (k, v) = parse_set_command("SET SESSION TIME ZONE DEFAULT").unwrap();
+        assert_eq!(k, "timezone");
+        assert_eq!(v, "DEFAULT");
+
+        let (k, v) = parse_set_command("set time zone 'Asia/Kuala_Lumpur'").unwrap();
+        assert_eq!(k, "timezone");
+        assert_eq!(v, "Asia/Kuala_Lumpur");
+
+        assert_eq!(parse_set_command("SET TIME ZONE "), None);
     }
 
     #[test]
