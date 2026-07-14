@@ -97,11 +97,11 @@ pub(super) fn is_calvin_foldable(plan: &PhysicalPlan) -> bool {
 /// resolved to an update or `INSERT 0 n` when it resolved to an insert.
 pub(super) fn tag_from_staged(kind: StagedTagKind, affected: usize) -> Tag {
     match kind {
-        StagedTagKind::Insert => Tag::new("INSERT").with_rows(affected),
+        StagedTagKind::Insert => Tag::new("INSERT").with_oid(0).with_rows(affected),
         StagedTagKind::Update => Tag::new("UPDATE").with_rows(affected),
         StagedTagKind::Delete => Tag::new("DELETE").with_rows(affected),
         StagedTagKind::KvUpsert { updated: true } => Tag::new("UPDATE").with_rows(affected),
-        StagedTagKind::KvUpsert { updated: false } => Tag::new("INSERT").with_rows(affected),
+        StagedTagKind::KvUpsert { updated: false } => Tag::new("INSERT").with_oid(0).with_rows(affected),
         // Matches the autocommit `DocumentOp::Upsert` tag exactly: always the
         // literal `UPSERT` command, regardless of insert-vs-update outcome
         // (see `response_shape::types::describe_plan`'s `DmlResult("UPSERT")`
@@ -137,7 +137,7 @@ pub(super) fn calvin_tag_for_plan(plan: &PhysicalPlan) -> Tag {
         | PhysicalPlan::Document(DocumentOp::PointInsert { .. })
         | PhysicalPlan::Kv(KvOp::Put { .. })
         | PhysicalPlan::Kv(KvOp::Insert { .. })
-        | PhysicalPlan::Kv(KvOp::InsertIfAbsent { .. }) => Tag::new("INSERT").with_rows(1),
+        | PhysicalPlan::Kv(KvOp::InsertIfAbsent { .. }) => Tag::new("INSERT").with_oid(0).with_rows(1),
 
         PhysicalPlan::Document(DocumentOp::PointUpdate {
             returning: None, ..
@@ -184,7 +184,13 @@ pub(super) fn payload_to_response(payload: &[u8], kind: PlanKind) -> ShapedRespo
             } else {
                 extract_affected_count(payload).unwrap_or(1) as usize
             };
-            Response::Execution(Tag::new(tag).with_rows(count)).into()
+            // PostgreSQL's INSERT CommandComplete tag carries a leading OID
+            // field ("INSERT 0 <n>"); libpq rejects the two-token form.
+            let mut t = Tag::new(tag);
+            if tag == "INSERT" {
+                t = t.with_oid(0);
+            }
+            Response::Execution(t.with_rows(count)).into()
         }
         PlanKind::ArraySlice | PlanKind::ReturningRows | PlanKind::SingleDocument => {
             unreachable!(
