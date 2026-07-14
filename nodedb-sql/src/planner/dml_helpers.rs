@@ -90,6 +90,9 @@ pub fn extract_point_keys(selection: Option<&ast::Expr>, info: &CollectionInfo) 
 
 fn collect_pk_equalities(expr: &ast::Expr, pk: &str, keys: &mut Vec<SqlValue>) {
     match expr {
+        // Parenthesized predicates (`WHERE ("t"."id" = 1)`) — the form libpq
+        // ORMs emit — are transparent for point-key extraction.
+        ast::Expr::Nested(inner) => collect_pk_equalities(inner, pk, keys),
         ast::Expr::BinaryOp {
             left,
             op: ast::BinaryOperator::Eq,

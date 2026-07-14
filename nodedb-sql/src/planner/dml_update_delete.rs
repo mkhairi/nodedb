@@ -6,7 +6,8 @@ use nodedb_types::DatabaseId;
 use sqlparser::ast;
 
 use super::super::ast_helpers::{
-    flatten_and_expr, qualified_ident_pair, strip_and_convert_filters,
+    flatten_and_expr, normalize_single_table_where, qualified_ident_pair,
+    strip_and_convert_filters,
 };
 use super::super::dml_helpers::{extract_point_keys, extract_table_name_from_table_with_joins};
 use crate::engine_rules::{self, DeleteParams, UpdateFromParams, UpdateParams};
@@ -39,12 +40,28 @@ pub fn plan_update(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
 
     let assigns = convert_assignments(&update.assignments)?;
 
-    let filters = match &update.selection {
+    // Collapse `table.col` / `alias.col` in WHERE to bare `col` (libpq ORMs
+    // always qualify); a foreign qualifier errors instead of matching nothing.
+    let target_alias: Option<String> = match &update.table.relation {
+        ast::TableFactor::Table { alias, .. } => alias.as_ref().map(|a| normalize_ident(&a.name)),
+        _ => None,
+    };
+    let mut qualifiers: Vec<&str> = vec![table_name.as_str()];
+    if let Some(a) = target_alias.as_deref() {
+        qualifiers.push(a);
+    }
+    let selection = update
+        .selection
+        .as_ref()
+        .map(|expr| normalize_single_table_where(expr, &qualifiers))
+        .transpose()?;
+
+    let filters = match &selection {
         Some(expr) => super::super::select::convert_where_to_filters(expr)?,
         None => Vec::new(),
     };
 
-    let target_keys = extract_point_keys(update.selection.as_ref(), &info);
+    let target_keys = extract_point_keys(selection.as_ref(), &info);
 
     let rules = engine_rules::resolve_engine_rules(info.engine);
     rules.plan_update(UpdateParams {
@@ -319,12 +336,32 @@ pub fn plan_delete(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
             name: table_name.clone(),
         })?;
 
-    let filters = match &delete.selection {
+    // Same qualifier normalization as plan_update: `table.col`/`alias.col`
+    // in WHERE collapses to bare `col`; foreign qualifiers error.
+    let target_alias: Option<String> = from_tables
+        .first()
+        .and_then(|t| match &t.relation {
+            ast::TableFactor::Table { alias, .. } => {
+                alias.as_ref().map(|a| normalize_ident(&a.name))
+            }
+            _ => None,
+        });
+    let mut qualifiers: Vec<&str> = vec![table_name.as_str()];
+    if let Some(a) = target_alias.as_deref() {
+        qualifiers.push(a);
+    }
+    let selection = delete
+        .selection
+        .as_ref()
+        .map(|expr| normalize_single_table_where(expr, &qualifiers))
+        .transpose()?;
+
+    let filters = match &selection {
         Some(expr) => super::super::select::convert_where_to_filters(expr)?,
         None => Vec::new(),
     };
 
-    let target_keys = extract_point_keys(delete.selection.as_ref(), &info);
+    let target_keys = extract_point_keys(selection.as_ref(), &info);
 
     let rules = engine_rules::resolve_engine_rules(info.engine);
     rules.plan_delete(DeleteParams {

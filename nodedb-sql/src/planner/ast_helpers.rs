@@ -136,6 +136,19 @@ fn strip_table_qualifiers(expr: &ast::Expr, qualifiers: &[&str]) -> ast::Expr {
         .fold(expr.clone(), |acc, q| strip_table_qualifier(&acc, q))
 }
 
+/// Normalize a single-table WHERE expression: reject a `table.col` qualifier
+/// that matches none of `valid_qualifiers` (typed `UnknownTable` error), then
+/// strip the valid qualifiers so `t.col` / `alias.col` collapse to a bare
+/// `col`. Mirror of `strip_single_table_qualifiers` for statements that carry
+/// a bare selection expression (UPDATE/DELETE).
+pub fn normalize_single_table_where(
+    expr: &ast::Expr,
+    valid_qualifiers: &[&str],
+) -> Result<ast::Expr> {
+    reject_foreign_qualifier(expr, valid_qualifiers)?;
+    Ok(strip_table_qualifiers(expr, valid_qualifiers))
+}
+
 /// Normalize a SINGLE-TABLE `SELECT` by stripping the (always-redundant) table
 /// qualifier from column refs in the projection, WHERE, and GROUP BY, returning
 /// a rewritten copy. `t.col` / `alias.col` collapse to `col` before the
