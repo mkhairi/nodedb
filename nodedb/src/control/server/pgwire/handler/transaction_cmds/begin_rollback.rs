@@ -21,7 +21,10 @@ impl NodeDbPgHandler {
         addr: &std::net::SocketAddr,
     ) -> PgWireResult<Vec<Response>> {
         match lifecycle::run_begin(&self.sessions, addr, &self.state) {
-            Ok(()) => Ok(vec![Response::Execution(Tag::new("BEGIN"))]),
+            // TransactionStart flips the ReadyForQuery status byte to 'T' —
+            // libpq tracks PQtransactionStatus from it and clients like
+            // Diesel abort COMMIT client-side if the server stays 'I'.
+            Ok(()) => Ok(vec![Response::TransactionStart(Tag::new("BEGIN"))]),
             Err(e) => {
                 let message = match &e {
                     crate::Error::BadRequest { detail } => detail.clone(),
@@ -44,6 +47,6 @@ impl NodeDbPgHandler {
     ) -> PgWireResult<Vec<Response>> {
         let dp = PgwireTxnDp { handler: self };
         lifecycle::run_rollback(&self.sessions, addr, identity, &self.state, &dp).await;
-        Ok(vec![Response::Execution(Tag::new("ROLLBACK"))])
+        Ok(vec![Response::TransactionEnd(Tag::new("ROLLBACK"))])
     }
 }

@@ -51,7 +51,7 @@ impl NodeDbPgHandler {
     ) -> PgWireResult<Vec<Response>> {
         let dp = PgwireTxnDp { handler: self };
         match commit::run_commit(&self.sessions, addr, identity, &self.state, &dp).await {
-            CommitOutcome::Committed => Ok(vec![Response::Execution(Tag::new("COMMIT"))]),
+            CommitOutcome::Committed => Ok(vec![Response::TransactionEnd(Tag::new("COMMIT"))]),
             CommitOutcome::Aborted { reason } => Err(commit_abort_to_pgerror(&reason)),
         }
     }
