@@ -87,6 +87,7 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
 
         // DML operations that return affected row count.
         PhysicalPlan::Document(DocumentOp::PointPut { .. })
+        | PhysicalPlan::Document(DocumentOp::PointInsert { .. })
         | PhysicalPlan::Document(DocumentOp::BatchInsert { .. })
         | PhysicalPlan::Columnar(ColumnarOp::Insert { .. }) => DmlResult("INSERT"),
 
