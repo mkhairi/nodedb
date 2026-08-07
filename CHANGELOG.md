@@ -27,6 +27,15 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - JWT bearer authentication over the HTTP API panicked the handler and dropped the connection. Cluster credential fetch on a token-authenticated join and JWKS setup at startup blocked the same way.
 - Refused native `document_put`, `document_delete`, `graph_insert_edge`, `graph_delete_edge` and CRDT movable-list operations returned success; `graph_traverse` and `vector_search` read an error reply as an empty result.
 - `CREATE INDEX IF NOT EXISTS` was misparsed as an index named `if` on a collection named `exists`.
+### Added
+
+- `nodedb-vector`: `portable-kernels` feature. Skips runtime CPU feature
+  detection and always selects the scalar distance kernels, so results are
+  bit-identical across machines. The SIMD kernels accumulate over different
+  lane widths and fuse multiply-add, so they round differently from one
+  another; a search whose scores differ by an ULP or two can therefore rank
+  two vectors differently depending on the host CPU. Intended for published
+  benchmark baselines and ranking regression fixtures, not for production.
 
 ---
 

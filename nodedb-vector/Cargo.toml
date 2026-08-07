@@ -17,6 +17,17 @@ default = []
 # Retains ACORN-1 as a feature-flagged baseline for benchmarking against NaviX.
 # Off by default; not intended for production use.
 acorn-baseline = []
+# Always select the scalar distance kernels instead of detecting AVX-512, AVX2
+# or NEON at runtime.
+#
+# The SIMD kernels accumulate across lanes and, on x86, fuse multiply-add, so
+# they round differently from each other and from scalar. The results agree to
+# well within any sane tolerance, but not bit-for-bit — which means a search
+# whose scores are separated by an ULP or two can rank two vectors differently
+# depending on which CPU it runs on. Enable this when a run has to be
+# reproducible across machines (published benchmark baselines, ranking
+# regression fixtures) and the throughput loss does not matter.
+portable-kernels = []
 
 [dependencies]
 nodedb-types = { workspace = true }

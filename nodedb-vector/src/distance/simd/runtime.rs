@@ -6,10 +6,10 @@ use super::hamming::fast_hamming;
 use super::scalar::{scalar_cosine, scalar_ip, scalar_l2};
 use crate::distance::typed_scalar;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "portable-kernels")))]
 use super::{avx2, avx512};
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(feature = "portable-kernels")))]
 use super::neon;
 
 /// Function pointer type for half-precision byte-level distance kernels.
@@ -34,8 +34,12 @@ pub struct SimdRuntime {
 
 impl SimdRuntime {
     /// Detect CPU features and select the best kernels.
+    ///
+    /// With the `portable-kernels` feature enabled, detection is skipped
+    /// entirely and the scalar kernels are always selected, so results are
+    /// bit-identical on every CPU.
     pub fn detect() -> Self {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(feature = "portable-kernels")))]
         {
             let has_vpopcntdq = std::is_x86_feature_detected!("avx512vpopcntdq");
 
@@ -83,7 +87,7 @@ impl SimdRuntime {
                 return rt;
             }
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", not(feature = "portable-kernels")))]
         {
             let rt = Self {
                 l2_squared: neon::l2_squared,
@@ -141,6 +145,29 @@ mod tests {
         let rt = SimdRuntime::detect();
         assert!(!rt.name.is_empty());
         tracing::info!("SIMD runtime: {}", rt.name);
+    }
+
+    #[cfg(feature = "portable-kernels")]
+    #[test]
+    fn portable_kernels_select_scalar_regardless_of_cpu() {
+        assert_eq!(SimdRuntime::detect().name, "scalar");
+    }
+
+    /// The scalar kernels are the reference implementation, so under
+    /// `portable-kernels` the selected kernels must agree with them exactly —
+    /// not within a tolerance, as the cross-checks below allow for the SIMD
+    /// paths. Anything less and a caller cannot rely on the same input
+    /// producing the same ranking on a different machine.
+    #[cfg(feature = "portable-kernels")]
+    #[test]
+    fn portable_kernels_match_scalar_bit_for_bit() {
+        let rt = runtime();
+        let a: Vec<f32> = (0..768).map(|i| (i as f32).sin()).collect();
+        let b: Vec<f32> = (0..768).map(|i| (i as f32).cos()).collect();
+
+        assert_eq!((rt.l2_squared)(&a, &b), scalar_l2(&a, &b));
+        assert_eq!((rt.cosine_distance)(&a, &b), scalar_cosine(&a, &b));
+        assert_eq!((rt.neg_inner_product)(&a, &b), scalar_ip(&a, &b));
     }
 
     #[test]
