@@ -7,6 +7,20 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- `nodedb-vector`: `portable-kernels` feature. Skips runtime CPU feature
+  detection and always selects the scalar distance kernels, so results are
+  bit-identical across machines. The SIMD kernels accumulate over different
+  lane widths and fuse multiply-add, so they round differently from one
+  another; a search whose scores differ by an ULP or two can therefore rank
+  two vectors differently depending on the host CPU. Intended for published
+  benchmark baselines and ranking regression fixtures, not for production.
+
+---
+
 ## [0.5.0] - 2026-08-04
 
 A security and durability release. It closes silent-failure paths in the WAL, replay, checkpoint, and sync layers, enforces authorization uniformly across transports, and makes expression errors, declared column widths, and affected-row counts report the truth instead of a plausible-looking wrong answer.
