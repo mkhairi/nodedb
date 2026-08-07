@@ -116,6 +116,19 @@ A feature and correctness release. It adds per-database backup with point-in-tim
 - `quinn-proto` 0.11.19: RUSTSEC-2026-0338, RUSTSEC-2026-0340.
 - `ruzstd` 0.9.1, WASM builds of `nodedb-codec` only: RUSTSEC-2026-0344.
 - `unsafe-libyaml` (unmaintained) is no longer in the dependency tree: RUSTSEC-2024-0449.
+- The published container image could not start: it ships `NODEDB_HOST=0.0.0.0` and the sync listener refuses a non-loopback bind. Sync no longer follows a routable `server.host`, and its port is no longer published from the image or compose file.
+- Native error frames authored as a bare SQLSTATE carried no numeric code, so DDL refusals arrived as generic internal errors and `is_retriable()` answered wrongly.
+- JWT bearer authentication over the HTTP API panicked the handler and dropped the connection. Cluster credential fetch on a token-authenticated join and JWKS setup at startup blocked the same way.
+- Refused native `document_put`, `document_delete`, `graph_insert_edge`, `graph_delete_edge` and CRDT movable-list operations returned success; `graph_traverse` and `vector_search` read an error reply as an empty result.
+- `CREATE INDEX IF NOT EXISTS` was misparsed as an index named `if` on a collection named `exists`.
+
+- `nodedb-vector`: `portable-kernels` feature. Skips runtime CPU feature
+  detection and always selects the scalar distance kernels, so results are
+  bit-identical across machines. The SIMD kernels accumulate over different
+  lane widths and fuse multiply-add, so they round differently from one
+  another; a search whose scores differ by an ULP or two can therefore rank
+  two vectors differently depending on the host CPU. Intended for published
+  benchmark baselines and ranking regression fixtures, not for production.
 
 ---
 
