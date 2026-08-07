@@ -18,6 +18,13 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - `CREATE [UNIQUE] INDEX IF NOT EXISTS`.
+- `nodedb-vector`: `portable-kernels` feature. Skips runtime CPU feature
+  detection and always selects the scalar distance kernels, so results are
+  bit-identical across machines. The SIMD kernels accumulate over different
+  lane widths and fuse multiply-add, so they round differently from one
+  another; a search whose scores differ by an ULP or two can therefore rank
+  two vectors differently depending on the host CPU. Intended for published
+  benchmark baselines and ranking regression fixtures, not for production.
 
 ### Fixed
 
