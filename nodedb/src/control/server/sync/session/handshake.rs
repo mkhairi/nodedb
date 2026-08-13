@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
+use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::jwt::JwtValidator;
 use crate::control::state::SharedState;
 
@@ -33,6 +34,19 @@ enum FencingDecision {
     RejectTransient,
 }
 
+/// How the handshake's `jwt_token` is authenticated.
+///
+/// The JWKS registry validates asynchronously, which the synchronous
+/// handshake cannot await, so the session loop resolves the token before
+/// calling in and hands the outcome over as [`TokenAuth::Registry`].
+/// Deployments with no registry configured keep the static validator.
+enum TokenAuth<'a> {
+    Static(&'a JwtValidator),
+    /// Already verified against the `JwksRegistry`; `Err` carries the
+    /// rejection reason reported back to the client.
+    Registry(Result<AuthenticatedIdentity, String>),
+}
+
 #[cfg(test)]
 fn producer_owner_matches(
     registration: &crate::control::sync_producer::ProducerRegistration,
@@ -55,6 +69,45 @@ impl SyncSession {
         &mut self,
         msg: &HandshakeMsg,
         jwt_validator: &JwtValidator,
+        current_server_clock: HashMap<String, u64>,
+        shared: Option<&Arc<SharedState>>,
+    ) -> Option<SyncFrame> {
+        self.handshake_with_auth(
+            msg,
+            TokenAuth::Static(jwt_validator),
+            current_server_clock,
+            shared,
+        )
+    }
+
+    /// Same handshake, for a token already verified against the JWKS registry.
+    ///
+    /// `verified` is the registry outcome for `msg.jwt_token`, resolved by the
+    /// async session loop because `JwksRegistry::validate_with_claims` is
+    /// async. The identity — including its tenant — comes from the registry,
+    /// which binds the provider's configured `tenant_id`, never the token's
+    /// `tenant_id` claim. Everything else (wire-version check, trust mode for
+    /// an empty token, durable fencing, signing key) is identical to
+    /// [`Self::handle_handshake`].
+    pub(in crate::control::server::sync) fn handle_handshake_verified(
+        &mut self,
+        msg: &HandshakeMsg,
+        verified: Result<AuthenticatedIdentity, String>,
+        current_server_clock: HashMap<String, u64>,
+        shared: Option<&Arc<SharedState>>,
+    ) -> Option<SyncFrame> {
+        self.handshake_with_auth(
+            msg,
+            TokenAuth::Registry(verified),
+            current_server_clock,
+            shared,
+        )
+    }
+
+    fn handshake_with_auth(
+        &mut self,
+        msg: &HandshakeMsg,
+        auth: TokenAuth<'_>,
         current_server_clock: HashMap<String, u64>,
         shared: Option<&Arc<SharedState>>,
     ) -> Option<SyncFrame> {
@@ -167,8 +220,15 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack);
         }
 
-        // Validate JWT.
-        match jwt_validator.validate(&msg.jwt_token) {
+        // Validate JWT: either through the JWKS registry (already resolved by
+        // the caller) or through the statically configured validator.
+        let validated = match auth {
+            TokenAuth::Static(jwt_validator) => jwt_validator
+                .validate(&msg.jwt_token)
+                .map_err(|e| e.to_string()),
+            TokenAuth::Registry(verified) => verified,
+        };
+        match validated {
             Ok(identity) => {
                 self.tenant_id = Some(identity.tenant_id);
                 self.username = Some(identity.username.clone());
@@ -263,7 +323,7 @@ impl SyncSession {
                     success: false,
                     session_id: self.session_id.clone(),
                     server_clock: HashMap::new(),
-                    error: Some(e.to_string()),
+                    error: Some(e),
                     fork_detected: false,
                     server_wire_version: crate::version::WIRE_FORMAT_VERSION,
                     producer_id: 0,
@@ -512,6 +572,8 @@ mod tests {
 
     use crate::bridge::dispatch::Dispatcher;
     use crate::control::security::catalog::SystemCatalog;
+    use crate::config::auth::JwtAuthConfig;
+    use crate::control::security::jwks::registry::JwksRegistry;
     use crate::control::security::jwt::{JwtConfig, JwtValidator};
     use crate::control::server::sync::session::state::SyncSession;
     use crate::control::server::sync::wire::CompensationHint;
@@ -893,5 +955,194 @@ mod tests {
             Some(CompensationHint::PermissionDenied)
         );
         assert_eq!(high_epoch_session.mutations_processed, 0);
+    }
+
+    // ── JWKS-registry handshake authentication ─────────────────────────
+    //
+    // These exercise the path the async session loop takes when
+    // `SharedState.jwks_registry` is configured: the registry validates the
+    // handshake token and `handle_handshake_verified` binds the session from
+    // the verified identity.
+
+    /// Serve a fixed JWKS document over HTTP on localhost. Returns its URL.
+    async fn spawn_jwks_endpoint(body: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        format!("http://localhost:{}/jwks.json", addr.port())
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Mint an RS256 JWT and the JWKS document that verifies it.
+    ///
+    /// `claimed_tenant_id` is written into the token so the tests can prove
+    /// the server binds the provider's tenant instead of the token's claim.
+    fn rs256_fixture(kid: &str, issuer: &str, audience: &str, claimed_tenant_id: u64) -> (String, String) {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+        use rsa::traits::PublicKeyParts;
+
+        let mut rng = rsa::rand_core::OsRng;
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let jwks = format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"{kid}","alg":"RS256","use":"sig","n":"{}","e":"{}"}}]}}"#,
+            b64(&public_key.n().to_bytes_be()),
+            b64(&public_key.e().to_bytes_be()),
+        );
+        let header = b64(format!(r#"{{"alg":"RS256","kid":"{kid}"}}"#).as_bytes());
+        let issued_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("fixture clock must be after epoch")
+            .as_secs();
+        let payload = b64(
+            format!(
+                r#"{{"iss":"{issuer}","aud":"{audience}","sub":"lite-replica","tenant_id":{claimed_tenant_id},"roles":["readwrite"],"iat":{issued_at},"exp":{},"user_id":42}}"#,
+                issued_at + 3_600
+            )
+            .as_bytes(),
+        );
+        let signing_input = format!("{header}.{payload}");
+        let signing_key = SigningKey::<sha2::Sha256>::new(private_key);
+        let signature: rsa::pkcs1v15::Signature = signing_key.sign(signing_input.as_bytes());
+        (jwks, format!("{signing_input}.{}", b64(&signature.to_bytes())))
+    }
+
+    fn provider_config(jwks_url: &str, issuer: &str, audience: &str, tenant_id: u64) -> JwtAuthConfig {
+        toml::from_str(&format!(
+            r#"
+allow_http_jwks = true
+allow_jwks_hosts = ["localhost"]
+allow_jwks_cidrs = ["127.0.0.0/8", "::1/128"]
+
+[[providers]]
+name = "sync-provider"
+jwks_url = "{jwks_url}"
+issuer = "{issuer}"
+audience = "{audience}"
+tenant_id = {tenant_id}
+"#
+        ))
+        .expect("JWT provider fixture must deserialize")
+    }
+
+    fn token_handshake(token: &str) -> HandshakeMsg {
+        HandshakeMsg {
+            jwt_token: token.into(),
+            ..make_handshake(crate::version::WIRE_FORMAT_VERSION)
+        }
+    }
+
+    const ISSUER: &str = "https://issuer.example.test/";
+    const AUDIENCE: &str = "nodedb-sync";
+
+    #[tokio::test]
+    async fn registry_verified_token_is_accepted_and_binds_provider_tenant() {
+        // The token claims tenant 999; the provider is bound to tenant 7.
+        let (jwks, token) = rs256_fixture("sync-key", ISSUER, AUDIENCE, 999);
+        let jwks_url = spawn_jwks_endpoint(jwks).await;
+        let registry = JwksRegistry::init(provider_config(&jwks_url, ISSUER, AUDIENCE, 7))
+            .await
+            .expect("registry must initialise");
+
+        let verified = registry
+            .validate_with_claims(&token)
+            .await
+            .map(|(identity, _)| identity)
+            .map_err(|e| e.to_string());
+
+        let mut session = SyncSession::new("registry-ok".into());
+        let frame = session
+            .handle_handshake_verified(
+                &token_handshake(&token),
+                verified,
+                HashMap::new(),
+                None,
+            )
+            .expect("handshake response");
+        let ack: HandshakeAckMsg = frame.decode_body().expect("decode handshake ack");
+
+        assert!(ack.success, "registry-verified token must be accepted: {:?}", ack.error);
+        assert!(session.authenticated);
+        let identity = session.identity.expect("verified identity");
+        assert_eq!(identity.username, "lite-replica");
+        assert_eq!(
+            identity.tenant_id.as_u64(),
+            7,
+            "tenant must come from provider config, never from the token claim"
+        );
+        assert_eq!(session.tenant_id.map(|t| t.as_u64()), Some(7));
+    }
+
+    #[tokio::test]
+    async fn token_signed_by_unknown_key_is_rejected() {
+        let (jwks, _good) = rs256_fixture("sync-key", ISSUER, AUDIENCE, 7);
+        // A second keypair whose public key is never published to the endpoint.
+        let (_unpublished, forged) = rs256_fixture("attacker-key", ISSUER, AUDIENCE, 7);
+        let jwks_url = spawn_jwks_endpoint(jwks).await;
+        let registry = JwksRegistry::init(provider_config(&jwks_url, ISSUER, AUDIENCE, 7))
+            .await
+            .expect("registry must initialise");
+
+        let verified = registry
+            .validate_with_claims(&forged)
+            .await
+            .map(|(identity, _)| identity)
+            .map_err(|e| e.to_string());
+        assert!(verified.is_err(), "an unknown signing key must not verify");
+
+        let mut session = SyncSession::new("registry-forged".into());
+        let frame = session
+            .handle_handshake_verified(
+                &token_handshake(&forged),
+                verified,
+                HashMap::new(),
+                None,
+            )
+            .expect("handshake response");
+        let ack: HandshakeAckMsg = frame.decode_body().expect("decode handshake ack");
+
+        assert!(!ack.success, "a token signed by an unknown key must be rejected");
+        assert!(ack.error.is_some());
+        assert!(!session.authenticated);
+        assert!(session.identity.is_none());
+        assert!(session.tenant_id.is_none());
+    }
+
+    #[test]
+    fn without_registry_a_token_still_uses_the_static_validator() {
+        // No registry configured: the static validator is unchanged, and with
+        // the default (unpinned-algorithm) JwtConfig it fails closed exactly
+        // as it did before registry support existed.
+        let mut session = SyncSession::new("no-registry".into());
+        let validator = JwtValidator::new(JwtConfig::default());
+
+        let frame = session
+            .handle_handshake(
+                &token_handshake("header.payload.signature"),
+                &validator,
+                HashMap::new(),
+                None,
+            )
+            .expect("handshake response");
+        let ack: HandshakeAckMsg = frame.decode_body().expect("decode handshake ack");
+
+        assert!(!ack.success);
+        assert!(!session.authenticated);
+        assert!(session.identity.is_none());
     }
 }

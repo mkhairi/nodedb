@@ -35,7 +35,7 @@ pub async fn query_ndjson(
 ) -> impl IntoResponse {
     use axum::response::Response;
 
-    let (identity, mut auth_ctx) = match resolve_auth(&headers, &state, "http") {
+    let (identity, mut auth_ctx) = match resolve_auth(&headers, &state, "http").await {
         Ok(auth) => auth,
         Err(e) => return e.into_response(),
     };

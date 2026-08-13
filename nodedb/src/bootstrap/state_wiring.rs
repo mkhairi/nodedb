@@ -27,7 +27,7 @@ pub struct SharedStateComponents {
 /// This includes: startup gate, cluster handles, JWKS, cold storage, snapshot
 /// storage, quarantine storage, memory governor, backup KEK, OTLP exporter,
 /// gateway, and bitemporal retention registry.
-pub fn wire_state(
+pub async fn wire_state(
     shared: &mut Arc<SharedState>,
     config: &ServerConfig,
     startup_gate: &Arc<StartupGate>,
@@ -96,9 +96,14 @@ pub fn wire_state(
         && !jwt_config.providers.is_empty()
         && let Some(state) = Arc::get_mut(shared)
     {
-        let registry = tokio::runtime::Handle::current().block_on(
-            crate::control::security::jwks::registry::JwksRegistry::init(jwt_config.clone()),
-        )?;
+        // `Handle::current().block_on` here panicked with "Cannot start a
+        // runtime from within a runtime": this runs on the async boot path, so
+        // blocking the worker driving it is not allowed. Any configured JWKS
+        // provider therefore killed startup — for HTTP and native auth as well
+        // as sync. Awaiting is the fix; the callers up to `main` are async.
+        let registry =
+            crate::control::security::jwks::registry::JwksRegistry::init(jwt_config.clone())
+                .await?;
         state.jwks_registry = Some(Arc::new(registry));
         info!(
             "JWKS registry initialised with {} providers",

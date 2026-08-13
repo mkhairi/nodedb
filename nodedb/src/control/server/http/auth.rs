@@ -32,7 +32,11 @@ pub struct AppState {
 ///
 /// Returns `Some(identity)` if the token is a valid JWT with 2 dots and
 /// the registry verifies the signature. Returns `None` otherwise.
-fn try_validate_jwt(
+///
+/// Awaits the registry rather than driving it with `Handle::block_on`: this
+/// runs on an async worker thread, where blocking the runtime from inside
+/// itself panics with "Cannot start a runtime from within a runtime".
+async fn try_validate_jwt(
     state: &AppState,
     token: &str,
 ) -> Option<(
@@ -41,8 +45,7 @@ fn try_validate_jwt(
 )> {
     if token.matches('.').count() == 2
         && let Some(ref registry) = state.shared.jwks_registry
-        && let Ok(verified) =
-            tokio::runtime::Handle::current().block_on(registry.validate_with_claims(token))
+        && let Ok(verified) = registry.validate_with_claims(token).await
     {
         Some(verified)
     } else {
@@ -56,7 +59,7 @@ fn try_validate_jwt(
 /// 1. `Authorization: Bearer eyJ...` — JWT (if JwksRegistry configured)
 /// 2. `Authorization: Bearer ndb_...` — API key
 /// 3. Trust mode (no header required) — if configured
-pub fn resolve_identity(
+pub async fn resolve_identity(
     headers: &HeaderMap,
     state: &AppState,
     peer_addr: &str,
@@ -70,7 +73,7 @@ pub fn resolve_identity(
             let token = token.trim();
 
             // Try JWT first (token has 2 dots = JWT format).
-            if let Some((identity, _)) = try_validate_jwt(state, token) {
+            if let Some((identity, _)) = try_validate_jwt(state, token).await {
                 return Ok(identity);
             }
 
@@ -126,7 +129,7 @@ pub fn require_tenant_admin_for_database(
 /// Uses `AuthContext::from_verified_jwt()` for JWTs so rich claims are retained
 /// while authorization fields remain bound to the verified identity. Falls back
 /// to `build_auth_context()` for API key / password auth.
-pub fn resolve_auth(
+pub async fn resolve_auth(
     headers: &HeaderMap,
     state: &AppState,
     peer_addr: &str,
@@ -145,7 +148,7 @@ pub fn resolve_auth(
         && let Some(token) = auth_str.strip_prefix("Bearer ")
     {
         let token = token.trim();
-        if let Some((identity, verified_claims)) = try_validate_jwt(state, token) {
+        if let Some((identity, verified_claims)) = try_validate_jwt(state, token).await {
             let auth_ctx =
                 AuthContext::from_verified_jwt(&verified_claims, &identity, generate_session_id());
             let auth_ctx = apply_on_deny_header(headers, auth_ctx);
@@ -154,7 +157,7 @@ pub fn resolve_auth(
     }
 
     // Fallback: resolve identity normally and build basic AuthContext.
-    let identity = resolve_identity(headers, state, peer_addr)?;
+    let identity = resolve_identity(headers, state, peer_addr).await?;
     let auth_ctx = apply_on_deny_header(headers, session_auth::build_auth_context(&identity));
     Ok((identity, auth_ctx))
 }
@@ -274,7 +277,7 @@ impl FromRequestParts<AppState> for ResolvedIdentity {
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map(|ci| ci.0.to_string())
             .unwrap_or_else(|| "http".to_string());
-        let identity = resolve_identity(&parts.headers, state, &peer)?;
+        let identity = resolve_identity(&parts.headers, state, &peer).await?;
         Ok(ResolvedIdentity(identity))
     }
 }
@@ -304,7 +307,7 @@ impl FromRequestParts<AppState> for ResolvedAuth {
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map(|ci| ci.0.to_string())
             .unwrap_or_else(|| "http".to_string());
-        let (identity, auth_ctx) = resolve_auth(&parts.headers, state, &peer)?;
+        let (identity, auth_ctx) = resolve_auth(&parts.headers, state, &peer).await?;
         Ok(ResolvedAuth(identity, auth_ctx))
     }
 }

@@ -30,7 +30,7 @@ pub async fn status(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _identity = resolve_identity(&headers, &state, "http")?;
+    let _identity = resolve_identity(&headers, &state, "http").await?;
 
     let wal_next_lsn = state.shared.wal.next_lsn().as_u64();
     let node_id = state.shared.node_id;

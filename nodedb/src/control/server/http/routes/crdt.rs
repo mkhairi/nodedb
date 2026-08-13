@@ -46,7 +46,7 @@ pub async fn crdt_apply(
     Path(collection): Path<String>,
     axum::Json(body): axum::Json<HttpCrdtApplyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let identity = resolve_identity(&headers, &state, "http")?;
+    let identity = resolve_identity(&headers, &state, "http").await?;
 
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.shared.audit));
     preflight_crdt_apply(

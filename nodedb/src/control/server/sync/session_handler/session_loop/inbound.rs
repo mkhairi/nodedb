@@ -16,7 +16,7 @@ use super::super::array::{build_array_inbound, dispatch_array_frame, is_array_fr
 use super::super::engine_dispatch::{EngineOutcome, dispatch_engine_frame};
 use super::channels::{Flow, SessionChannels};
 use crate::control::server::sync::wire::{
-    DeltaPushMsg, PresenceUpdateMsg, SyncFrame, SyncMessageType,
+    DeltaPushMsg, HandshakeMsg, PresenceUpdateMsg, SyncFrame, SyncMessageType,
 };
 
 type Ws = WebSocketStream<tokio::net::TcpStream>;
@@ -45,6 +45,34 @@ pub(super) async fn handle_frame(ws: &mut Ws, ctx: InboundCtx<'_>, frame: &SyncF
         jwt_validator,
         session_id,
     } = ctx;
+
+    // A token-bearing handshake is authenticated against the JWKS registry
+    // whenever one is configured, so the sync protocol accepts the same JWTs
+    // as HTTP, native and OTEL. Registry validation is async (it may re-fetch
+    // a keyset), which the synchronous `process_frame` dispatch below cannot
+    // await — so it runs here and the verified outcome is handed over.
+    //
+    // With no registry, or for an empty token (trust mode), the frame falls
+    // through to the pre-existing static `JwtValidator` path unchanged.
+    if frame.msg_type == SyncMessageType::Handshake
+        && let Some(state) = shared.as_ref()
+        && let Some(registry) = state.jwks_registry.as_ref()
+        && let Some(msg) = frame.decode_body::<HandshakeMsg>()
+        && !msg.jwt_token.is_empty()
+    {
+        let verified = registry
+            .validate_with_claims(&msg.jwt_token)
+            .await
+            .map(|(identity, _claims)| identity)
+            .map_err(|e| e.to_string());
+        let server_clock = session.server_clock.clone();
+        let response =
+            session.handle_handshake_verified(&msg, verified, server_clock, Some(state));
+        return match response {
+            Some(r) => Flow::from_send(send(ws, &r).await),
+            None => Flow::Continue,
+        };
+    }
 
     // Shape frames read collection data, so they require an authenticated
     // session exactly as the engine and CRDT frames below do. Handling them

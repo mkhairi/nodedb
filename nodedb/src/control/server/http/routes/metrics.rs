@@ -15,7 +15,7 @@ pub async fn metrics(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let identity = resolve_identity(&headers, &state, "http")?;
+    let identity = resolve_identity(&headers, &state, "http").await?;
 
     if !identity.is_superuser
         && !identity.has_role(&crate::control::security::identity::Role::Monitor)

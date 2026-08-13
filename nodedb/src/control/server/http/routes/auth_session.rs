@@ -40,7 +40,7 @@ pub async fn create_session(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (identity, auth_ctx) = resolve_auth(&headers, &state, "http")?;
+    let (identity, auth_ctx) = resolve_auth(&headers, &state, "http").await?;
 
     let fingerprint = ClientFingerprint::from_peer(identity.tenant_id, &peer);
     let handle = state.shared.session_handles.create(auth_ctx, fingerprint);
@@ -70,7 +70,7 @@ pub async fn delete_session(
     // Auth check must come first — return 401/403 before touching session state.
     let _identity = {
         let peer_str = peer.to_string();
-        crate::control::server::http::auth::resolve_identity(&headers, &state, &peer_str)?
+        crate::control::server::http::auth::resolve_identity(&headers, &state, &peer_str).await?
     };
 
     let handle = headers

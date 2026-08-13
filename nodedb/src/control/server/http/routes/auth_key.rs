@@ -24,7 +24,7 @@ pub async fn exchange_key(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<HttpExchangeKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (identity, _auth_ctx) = resolve_auth(&headers, &state, "http")?;
+    let (identity, _auth_ctx) = resolve_auth(&headers, &state, "http").await?;
 
     let auth_user_id = identity.user_id.to_string();
     let rate_limit_qps = body.rate_limit_qps.unwrap_or(0);
