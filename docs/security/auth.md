@@ -131,6 +131,38 @@ Supported algorithms: ES256, ES384, RS256. Built-in JWKS cache with disk fallbac
 
 JWTs may assert ordinary built-in and custom roles, but they cannot assert NodeDB superuser authority. NodeDB ignores both the `is_superuser` claim and the `"superuser"` role string on every external JWT path. Superuser must be granted through NodeDB credential administration.
 
+### Authorizing a JWT sync client
+
+A verified token authenticates a sync session; it does not authorize one. The
+identity it produces holds exactly the roles its `roles` claim names, and role
+names are matched **exactly**:
+
+| `roles` entry                | Confers                                                                 |
+| ---------------------------- | ----------------------------------------------------------------------- |
+| `readwrite`                  | Read, Write, Execute on every collection in the bound tenant             |
+| `readonly`                   | Read, Execute                                                            |
+| `tenant_admin`               | Everything within the tenant                                             |
+| `database_editor:<db_id>`    | Read, Write, **Create**, Execute within that database                    |
+| `database_owner:<db_id>`     | Everything within that database                                          |
+| anything else                | A custom role, which confers **nothing** until a grant names it          |
+
+A name outside that set is not an error — it becomes `Role::Custom`, so a token
+saying `read_write` (one underscore) authenticates perfectly and is then denied
+on every write. The `roles` claim is not the only way in: `GRANT WRITE ON
+TENANT <name> TO <user>` or a per-collection grant authorizes the same
+principal without touching the token.
+
+A replica's **first** sync also materializes its collections on the Origin,
+which is a `Create` at database scope — `readwrite` does not confer it. Use
+`database_editor:<db_id>` (`0` is the default database), grant
+`CREATE_COLLECTION` on the database, or create the collections on the Origin
+before the replica connects.
+
+A session bound with no tenant-wide write authority is accepted (per-collection
+grants cannot be enumerated at handshake time) but logs a warning naming the
+roles it presented — that line, not the per-delta denials that follow, is the
+one that says why replication is refused.
+
 ## mTLS (Mutual TLS)
 
 For zero-trust environments. Both client and server present certificates.
