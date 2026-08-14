@@ -134,6 +134,57 @@ mod tests {
         );
     }
 
+    /// The role name a JWT carries decides whether its sync session can write
+    /// anything at all, and it is matched exactly. `read_write` is not a
+    /// NodeDB role: it parses as a custom role, which grants nothing until
+    /// something is granted to it. NDB-AQL-29 was that one underscore — the
+    /// handshake succeeded, every delta was refused, and the client threw the
+    /// refused writes away.
+    #[test]
+    fn a_role_name_outside_the_built_in_set_confers_no_write() {
+        let mut identity = identity();
+        identity.roles = vec![
+            "read_write"
+                .parse()
+                .expect("role names never fail to parse"),
+        ];
+        assert_eq!(
+            identity.roles,
+            vec![crate::control::security::identity::Role::Custom(
+                "read_write".into()
+            )],
+            "an unrecognised name must land in Custom, not silently near-match a built-in"
+        );
+
+        assert_eq!(
+            authorize_delta_write_with(
+                Some(&identity),
+                "orders",
+                &PermissionStore::new(),
+                &RoleStore::new(),
+                &NoopAuditEmitter,
+            ),
+            Err(DeltaAuthorizationFailure::PermissionDenied)
+        );
+    }
+
+    /// The spelling that works, pinned beside the one that does not.
+    #[test]
+    fn the_readwrite_role_authorizes_every_collection_in_the_tenant() {
+        let mut identity = identity();
+        identity.roles = vec!["readwrite".parse().expect("role names never fail to parse")];
+
+        let tenant_id = authorize_delta_write_with(
+            Some(&identity),
+            "orders",
+            &PermissionStore::new(),
+            &RoleStore::new(),
+            &NoopAuditEmitter,
+        )
+        .expect("readwrite must authorize a sync delta write");
+        assert_eq!(tenant_id, TenantId::new(9));
+    }
+
     #[test]
     fn missing_identity_fails_closed_without_audit_principal() {
         let permissions = PermissionStore::new();
