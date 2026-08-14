@@ -47,6 +47,57 @@ enum TokenAuth<'a> {
     Registry(Result<AuthenticatedIdentity, String>),
 }
 
+/// Report, once per session, an authenticated sync identity that holds no
+/// write authority at all.
+///
+/// This is a diagnostic, never a gate: per-collection grants are not
+/// enumerable here, so an identity that fails this check may still be able to
+/// write somewhere and the session is accepted either way. What it replaces is
+/// the only evidence the failure otherwise leaves — one ERROR per refused
+/// delta, naming the collection but never the reason the principal has no
+/// authority over it.
+///
+/// The usual reason is the `roles` claim. Role names are matched exactly
+/// (`readwrite`, `readonly`, `tenant_admin`, `monitor`,
+/// `database_owner:<db>`, `database_editor:<db>`, `database_reader:<db>`); a
+/// name outside that set is accepted as a custom role, which confers nothing
+/// until something is granted to it. So `read_write` — one underscore away
+/// from the role that would have worked — authenticates perfectly and then
+/// cannot write a single row.
+fn warn_if_no_write_authority(
+    session_id: &str,
+    identity: &AuthenticatedIdentity,
+    shared: &Arc<SharedState>,
+) {
+    use crate::control::security::audit::NoopAuditEmitter;
+    use crate::control::security::identity::Permission;
+
+    let audit = NoopAuditEmitter;
+    if shared.permissions.check_tenant(
+        identity,
+        Permission::Write,
+        identity.tenant_id,
+        &shared.roles,
+        &audit,
+    ) {
+        return;
+    }
+
+    let roles: Vec<String> = identity.roles.iter().map(ToString::to_string).collect();
+    warn!(
+        session = %session_id,
+        user = %identity.username,
+        tenant = identity.tenant_id.as_u64(),
+        roles = ?roles,
+        "sync session has no tenant-wide write authority: unless this principal holds \
+         per-collection grants, every delta it pushes will be refused. Grant it a role in \
+         the token's `roles` claim (`readwrite` for writes; `database_editor:<database_id>` \
+         also allows the collection materialization a first sync needs), or GRANT WRITE ON \
+         TENANT to this user. Role names are matched exactly — an unrecognised name becomes \
+         a custom role with no permissions"
+    );
+}
+
 #[cfg(test)]
 fn producer_owner_matches(
     registration: &crate::control::sync_producer::ProducerRegistration,
@@ -299,6 +350,9 @@ impl SyncSession {
                     shapes = self.subscribed_shapes.len(),
                     "sync handshake OK"
                 );
+                if let Some(state) = shared {
+                    warn_if_no_write_authority(&self.session_id, &identity, state);
+                }
 
                 let ack = HandshakeAckMsg {
                     success: true,
