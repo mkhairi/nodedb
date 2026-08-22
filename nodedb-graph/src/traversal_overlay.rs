@@ -18,6 +18,9 @@ use crate::overlay_delta::GraphOverlayDelta;
 
 impl CsrIndex {
     /// String-keyed BFS that merges the transaction's staged edges/tombstones.
+    ///
+    /// Returns nodes in BFS discovery order, matching the guarantee documented
+    /// on [`CsrIndex::traverse_bfs`].
     pub(crate) fn traverse_bfs_overlay(
         &self,
         params: BfsParams<'_>,
@@ -33,10 +36,14 @@ impl CsrIndex {
         } = params;
         let label_id = label_filter.and_then(|l| self.label_id(l));
         let mut visited: HashSet<String> = HashSet::new();
+        // Discovery order of `visited`, kept alongside it because a HashSet
+        // iterates in per-instance seed order.
+        let mut discovered: Vec<String> = Vec::new();
         let mut queue: VecDeque<(String, usize)> = VecDeque::new();
 
         for &node in start_nodes {
             if visited.insert(node.to_string()) {
+                discovered.push(node.to_string());
                 queue.push_back((node.to_string(), 0));
             }
         }
@@ -67,13 +74,15 @@ impl CsrIndex {
                         }) {
                             continue;
                         }
-                        self.enqueue_str(
+                        if self.enqueue_str(
                             dst_name,
                             next_depth,
                             max_visited,
                             &mut visited,
                             &mut queue,
-                        );
+                        ) {
+                            discovered.push(dst_name.clone());
+                        }
                     }
                 }
                 if want_in {
@@ -90,13 +99,15 @@ impl CsrIndex {
                         }) {
                             continue;
                         }
-                        self.enqueue_str(
+                        if self.enqueue_str(
                             src_name,
                             next_depth,
                             max_visited,
                             &mut visited,
                             &mut queue,
-                        );
+                        ) {
+                            discovered.push(src_name.clone());
+                        }
                     }
                 }
             }
@@ -110,7 +121,9 @@ impl CsrIndex {
                     .map(|(_, dst)| dst.to_string())
                     .collect();
                 for dst in staged {
-                    self.enqueue_str(&dst, next_depth, max_visited, &mut visited, &mut queue);
+                    if self.enqueue_str(&dst, next_depth, max_visited, &mut visited, &mut queue) {
+                        discovered.push(dst);
+                    }
                 }
             }
             if want_in {
@@ -119,12 +132,14 @@ impl CsrIndex {
                     .map(|(_, src)| src.to_string())
                     .collect();
                 for src in staged {
-                    self.enqueue_str(&src, next_depth, max_visited, &mut visited, &mut queue);
+                    if self.enqueue_str(&src, next_depth, max_visited, &mut visited, &mut queue) {
+                        discovered.push(src);
+                    }
                 }
             }
         }
 
-        visited.into_iter().collect()
+        discovered
     }
 
     /// String-keyed subgraph materialization merging staged edges/tombstones.
@@ -227,7 +242,9 @@ impl CsrIndex {
     }
 
     /// Enqueue `name` at `next_depth` if it is newly visited and the visited
-    /// cap has not been reached.
+    /// cap has not been reached. Returns whether it was newly enqueued, which
+    /// callers that must report discovery order use to append to their order
+    /// vector.
     fn enqueue_str(
         &self,
         name: &str,
@@ -235,10 +252,12 @@ impl CsrIndex {
         max_visited: usize,
         visited: &mut HashSet<String>,
         queue: &mut VecDeque<(String, usize)>,
-    ) {
+    ) -> bool {
         if visited.len() < max_visited && visited.insert(name.to_string()) {
             queue.push_back((name.to_string(), next_depth));
+            return true;
         }
+        false
     }
 }
 
@@ -339,6 +358,47 @@ mod tests {
             Some(&ov),
         );
         assert!(edges.contains(&("z".into(), "KNOWS".into(), "a".into())));
+    }
+
+    /// The overlay path carries the same BFS-discovery-order guarantee as the
+    /// durable path: repeated identical traversals return the identical
+    /// sequence, nearest first.
+    #[test]
+    fn overlay_bfs_returns_a_stable_breadth_first_order() {
+        let mut csr = CsrIndex::new();
+        for b in 0..20 {
+            csr.add_edge("root", "KNOWS", &format!("d{b}")).unwrap();
+        }
+        let mut ov = GraphOverlayDelta::new();
+        for b in 0..20 {
+            ov.stage_edge(&format!("d{b}"), "KNOWS", &format!("s{b}"));
+        }
+
+        let run = || {
+            csr.traverse_bfs(
+                BfsParams {
+                    start_nodes: &["root"],
+                    label_filter: None,
+                    direction: Direction::Out,
+                    max_depth: 2,
+                    max_visited: DEFAULT_MAX_VISITED,
+                    frontier_bitmap: None,
+                },
+                Some(&ov),
+            )
+        };
+
+        let first = run();
+        assert_eq!(first.len(), 41);
+        for i in 1..8 {
+            assert_eq!(run(), first, "traversal {i} returned a different order");
+        }
+
+        assert_eq!(first[0], "root");
+        // Every durable depth-1 node precedes every staged depth-2 node.
+        let last_d = first.iter().rposition(|n| n.starts_with('d')).unwrap();
+        let first_s = first.iter().position(|n| n.starts_with('s')).unwrap();
+        assert!(last_d < first_s, "result is not breadth-first: {first:?}");
     }
 
     #[test]

@@ -22,6 +22,12 @@ use crate::path_params::ShortestPathParams;
 impl CsrIndex {
     /// BFS traversal. Returns all reachable node IDs within max_depth hops.
     ///
+    /// Nodes are returned in BFS discovery order — the start nodes first, then
+    /// each node in the order it was first reached, so nearer nodes always
+    /// precede farther ones. The order is stable across identical calls;
+    /// callers taking a bounded prefix get the nearest neighbours, not a
+    /// sample of a shuffle.
+    ///
     /// `max_visited` caps the number of nodes visited to prevent supernode fan-out
     /// explosion. Pass [`DEFAULT_MAX_VISITED`] for the standard limit.
     ///
@@ -57,12 +63,17 @@ impl CsrIndex {
         } = params;
         let label_id = label_filter.and_then(|l| self.label_id(l));
         let mut visited: HashSet<u32> = HashSet::new();
+        // Discovery order of `visited`, kept alongside it because a HashSet
+        // iterates in per-instance seed order — see the ordering guarantee on
+        // [`CsrIndex::traverse_bfs`].
+        let mut discovered: Vec<u32> = Vec::new();
         let mut queue: VecDeque<(u32, usize)> = VecDeque::new();
 
         for &node in start_nodes {
             if let Some(&id) = self.node_to_id.get(node)
                 && visited.insert(id)
             {
+                discovered.push(id);
                 queue.push_back((id, 0));
             }
         }
@@ -85,6 +96,7 @@ impl CsrIndex {
                         && visited.insert(dst)
                     {
                         self.prefetch_node(dst);
+                        discovered.push(dst);
                         queue.push_back((dst, depth + 1));
                     }
                 }
@@ -99,19 +111,24 @@ impl CsrIndex {
                         && visited.insert(src)
                     {
                         self.prefetch_node(src);
+                        discovered.push(src);
                         queue.push_back((src, depth + 1));
                     }
                 }
             }
         }
 
-        visited
+        discovered
             .into_iter()
             .map(|id| self.id_to_node[id as usize].clone())
             .collect()
     }
 
     /// BFS traversal returning nodes with depth information.
+    ///
+    /// Nodes are returned in BFS discovery order, so depths are non-decreasing
+    /// across the result and the order is stable across identical calls. See
+    /// [`CsrIndex::traverse_bfs_with_depth_multi`].
     ///
     /// `max_visited` caps the number of nodes visited to prevent supernode fan-out
     /// explosion. Pass [`DEFAULT_MAX_VISITED`] for the standard limit.
@@ -129,6 +146,12 @@ impl CsrIndex {
 
     /// BFS traversal with multi-label filter. Empty labels = all edges.
     ///
+    /// Nodes are returned in BFS discovery order — the start nodes first, then
+    /// each node in the order it was first reached — so depths are
+    /// non-decreasing across the result and the order is stable across
+    /// identical calls. Callers taking a bounded prefix get the nearest
+    /// neighbours, not a sample of a shuffle.
+    ///
     /// `max_visited` caps the number of nodes visited to prevent supernode fan-out
     /// explosion. Pass [`DEFAULT_MAX_VISITED`] for the standard limit.
     pub fn traverse_bfs_with_depth_multi(
@@ -145,11 +168,17 @@ impl CsrIndex {
             .collect();
         let match_label = |lid: u32| label_ids.is_empty() || label_ids.contains(&lid);
         let mut visited: HashMap<u32, u8> = HashMap::new();
+        // Discovery order of `visited`, kept alongside it because a HashMap
+        // iterates in per-instance seed order — see the ordering guarantee
+        // above.
+        let mut discovered: Vec<(u32, u8)> = Vec::new();
         let mut queue: VecDeque<(u32, u8)> = VecDeque::new();
 
         for &node in start_nodes {
-            if let Some(&id) = self.node_to_id.get(node) {
-                visited.insert(id, 0);
+            if let Some(&id) = self.node_to_id.get(node)
+                && visited.insert(id, 0).is_none()
+            {
+                discovered.push((id, 0));
                 queue.push_back((id, 0));
             }
         }
@@ -168,6 +197,7 @@ impl CsrIndex {
                         && !visited.contains_key(&dst)
                     {
                         visited.insert(dst, next_depth);
+                        discovered.push((dst, next_depth));
                         queue.push_back((dst, next_depth));
                     }
                 }
@@ -179,13 +209,14 @@ impl CsrIndex {
                         && !visited.contains_key(&src)
                     {
                         visited.insert(src, next_depth);
+                        discovered.push((src, next_depth));
                         queue.push_back((src, next_depth));
                     }
                 }
             }
         }
 
-        visited
+        discovered
             .into_iter()
             .map(|(id, depth)| (self.id_to_node[id as usize].clone(), depth))
             .collect()
@@ -513,6 +544,76 @@ mod tests {
         assert_eq!(map["b"], 1);
         assert_eq!(map["c"], 2);
         assert_eq!(map["d"], 3);
+    }
+
+    /// Builds a root with `branches` outgoing chains of 3 hops each. Wide
+    /// enough that a hash-ordered result is virtually never in BFS order.
+    fn make_star_of_chains(branches: usize) -> CsrIndex {
+        let mut csr = CsrIndex::new();
+        for b in 0..branches {
+            csr.add_edge("root", "L", &format!("b{b}h0")).unwrap();
+            csr.add_edge(&format!("b{b}h0"), "L", &format!("b{b}h1"))
+                .unwrap();
+            csr.add_edge(&format!("b{b}h1"), "L", &format!("b{b}h2"))
+                .unwrap();
+        }
+        csr
+    }
+
+    /// Repeated identical traversals must return the identical sequence, and
+    /// that sequence must be breadth-first (depth never decreases). Prior to
+    /// the discovery-order fix the result came straight out of a `HashMap`,
+    /// whose per-instance `RandomState` seed reshuffled it on every call.
+    #[test]
+    fn bfs_with_depth_returns_a_stable_breadth_first_order() {
+        let csr = make_star_of_chains(20);
+        let run = || {
+            csr.traverse_bfs_with_depth(&["root"], Some("L"), Direction::Out, 3, DEFAULT_MAX_VISITED)
+        };
+
+        let first = run();
+        assert_eq!(first.len(), 61);
+        for i in 1..8 {
+            assert_eq!(run(), first, "traversal {i} returned a different order");
+        }
+
+        assert_eq!(first[0], ("root".to_string(), 0));
+        assert!(
+            first.windows(2).all(|w| w[0].1 <= w[1].1),
+            "result is not breadth-first: {first:?}"
+        );
+    }
+
+    /// Same guarantee for the plain (depth-less) dense BFS, which accumulated
+    /// its result in a `HashSet`.
+    #[test]
+    fn bfs_returns_a_stable_breadth_first_order() {
+        let csr = make_star_of_chains(20);
+        let run = || {
+            csr.traverse_bfs(
+                BfsParams {
+                    start_nodes: &["root"],
+                    label_filter: Some("L"),
+                    direction: Direction::Out,
+                    max_depth: 3,
+                    max_visited: DEFAULT_MAX_VISITED,
+                    frontier_bitmap: None,
+                },
+                None,
+            )
+        };
+
+        let first = run();
+        assert_eq!(first.len(), 61);
+        for i in 1..8 {
+            assert_eq!(run(), first, "traversal {i} returned a different order");
+        }
+
+        assert_eq!(first[0], "root");
+        // Depth 1 nodes ("b*h0") all precede any depth 2 node ("b*h1").
+        let last_h0 = first.iter().rposition(|n| n.ends_with("h0")).unwrap();
+        let first_h1 = first.iter().position(|n| n.ends_with("h1")).unwrap();
+        assert!(last_h0 < first_h1, "result is not breadth-first: {first:?}");
     }
 
     fn path_params<'a>(
