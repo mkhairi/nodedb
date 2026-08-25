@@ -32,6 +32,7 @@ pub use backend::FtsBackend;
 pub use block::{CompactPosting, PostingBlock};
 pub use fuzzy::{fuzzy_discount, fuzzy_match, levenshtein, max_distance_for_length};
 pub use index::{FtsIndex, FtsIndexError, MAX_INDEXABLE_SURROGATE, SynonymGroupRecord};
+pub use lsm::memtable::MemtableConfig;
 pub use nodedb_types::Surrogate;
 pub use posting::{Bm25Params, MatchOffset, Posting, QueryMode, TextSearchResult};
 pub use search::bm25_search::FtsSearchParams;

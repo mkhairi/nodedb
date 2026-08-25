@@ -57,6 +57,22 @@ impl<B: FtsBackend> FtsIndex<B> {
         }
     }
 
+    /// Create a new FTS index with custom memtable spill thresholds.
+    ///
+    /// Backends that keep segments in process memory rather than on durable
+    /// storage gain nothing from spilling — the postings occupy the same RAM
+    /// either way — and lose anything a memtable-only checkpoint would have
+    /// persisted. Such backends pass a config that never spills.
+    pub fn with_memtable_config(backend: B, memtable: MemtableConfig) -> Self {
+        Self {
+            backend,
+            bm25_params: Bm25Params::default(),
+            memtable: Memtable::new(memtable),
+            next_segment_id: AtomicU64::new(1),
+            governor: None,
+        }
+    }
+
     /// Create a new FTS index with custom BM25 parameters.
     pub fn with_params(backend: B, params: Bm25Params) -> Self {
         Self {
