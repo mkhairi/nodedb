@@ -179,11 +179,18 @@ impl<B: FtsBackend> FtsIndex<B> {
 
     /// Flush the active memtable to an immutable segment in the backend.
     ///
-    /// Calling this before serializing the index guarantees that all posting
-    /// data written since the last spill threshold is captured in the backend's
-    /// segment storage rather than the in-memory memtable.  Callers that
-    /// checkpoint the index (e.g., NodeDB-Lite flush) must call this once per
-    /// active index before persisting.
+    /// **Do not call this to prepare for a checkpoint.** This drains the
+    /// memtable, so a serializer that persists the memtable — as NodeDB-Lite's
+    /// does — will write nothing and lose every posting drained here. The
+    /// advice this comment used to give was the direct cause of NDB-AQL-37, in
+    /// which a live store silently lost most of its index. A checkpoint must
+    /// persist whatever the memtable holds, or the segments too, but never
+    /// move data out of the one it reads.
+    ///
+    /// Note also that the postings land in the segment dictionary under the
+    /// memtable's *scoped* keys, which segment queries do not use — see the
+    /// bare-token lookup in `lsm::query::collect_merged_term_blocks`. Spilled
+    /// segments are therefore not currently searchable at all.
     pub fn flush_memtable(
         &self,
         database_id: u64,
