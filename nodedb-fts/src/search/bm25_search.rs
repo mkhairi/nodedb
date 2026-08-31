@@ -200,10 +200,15 @@ impl<B: FtsBackend> FtsIndex<B> {
                 })
                 .collect();
             let mut sorted = penalized;
+            // Break ties on doc id. Scores alone leave equal-scoring documents
+            // in whatever order they arrived, and `truncate` below then keeps
+            // an arbitrary subset of them — so a top-k query over tied
+            // documents can answer with a different SET each run.
             sorted.sort_by(|a, b| {
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.doc_id.cmp(&b.doc_id))
             });
             sorted.truncate(top_k);
             return Ok(sorted);
@@ -462,10 +467,16 @@ impl<B: FtsBackend> FtsIndex<B> {
                 fuzzy: fuzzy_flag,
             })
             .collect();
+        // Break ties on doc id. `doc_scores` is a HashMap, whose iteration
+        // order comes from a per-process RandomState seed, and `sort_by` is
+        // stable — so without this, equal-scoring documents come out in an
+        // order that changes between runs, and `truncate` keeps a different
+        // subset of them each time. Same data, same query, different answer.
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
         });
         results.truncate(top_k);
         results
@@ -488,6 +499,51 @@ mod tests {
     const D1: Surrogate = Surrogate(1);
     const D2: Surrogate = Surrogate(2);
     const D3: Surrogate = Surrogate(3);
+
+    /// Documents that score identically must come back in a stable order, and
+    /// the same subset must survive `top_k`.
+    ///
+    /// `to_sorted_results` collects from a `HashMap`, whose iteration order is
+    /// derived from a per-process `RandomState` seed, and sorts stably on score
+    /// alone. Without a tie-break, equal-scoring documents come out in a
+    /// different order every run — and because `truncate` follows the sort, a
+    /// top-k query over more ties than slots answers with a different SET of
+    /// documents each time.
+    ///
+    /// The shuffle below stands in for that reseeding: it is the same input set
+    /// in different orders, which is exactly what the hasher produces run to
+    /// run.
+    #[test]
+    fn tied_scores_truncate_to_the_same_documents_whatever_order_they_arrive_in() {
+        use std::collections::HashMap;
+
+        let tied = |ids: &[u32]| -> Vec<Surrogate> {
+            let scores: HashMap<Surrogate, (f32, bool, usize)> = ids
+                .iter()
+                .map(|&i| (Surrogate(i), (1.0f32, false, 1)))
+                .collect();
+            FtsIndex::<MemoryBackend>::to_sorted_results(scores, 3)
+                .into_iter()
+                .map(|r| r.doc_id)
+                .collect()
+        };
+
+        let ascending = tied(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let descending = tied(&[8, 7, 6, 5, 4, 3, 2, 1]);
+        let shuffled = tied(&[4, 8, 1, 6, 3, 7, 2, 5]);
+
+        assert_eq!(ascending.len(), 3);
+        assert_eq!(
+            ascending, descending,
+            "the surviving top-3 must not depend on arrival order"
+        );
+        assert_eq!(ascending, shuffled);
+        assert_eq!(
+            ascending,
+            vec![Surrogate(1), Surrogate(2), Surrogate(3)],
+            "ties resolve by doc id, so the choice is explainable rather than arbitrary"
+        );
+    }
 
     fn make_index() -> FtsIndex<MemoryBackend> {
         let idx = FtsIndex::new(MemoryBackend::new());
