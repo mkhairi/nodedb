@@ -187,10 +187,10 @@ impl<B: FtsBackend> FtsIndex<B> {
     /// persist whatever the memtable holds, or the segments too, but never
     /// move data out of the one it reads.
     ///
-    /// Note also that the postings land in the segment dictionary under the
-    /// memtable's *scoped* keys, which segment queries do not use — see the
-    /// bare-token lookup in `lsm::query::collect_merged_term_blocks`. Spilled
-    /// segments are therefore not currently searchable at all.
+    /// The postings land in the segment dictionary under the memtable's
+    /// *scoped* keys, and `lsm::query::collect_merged_term_blocks` looks them
+    /// up the same way. It used to look them up by the bare token, which found
+    /// nothing, so spilled segments were not searchable at all.
     pub fn flush_memtable(
         &self,
         database_id: u64,

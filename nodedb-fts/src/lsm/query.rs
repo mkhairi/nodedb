@@ -58,7 +58,14 @@ pub fn collect_merged_term_blocks<B: FtsBackend>(
         let seg_postings: Vec<Vec<CompactPosting>> = readers
             .iter()
             .map(|reader| {
-                let blocks = reader.read_postings(token);
+                // Segments are keyed the same way the memtable is. A spill
+                // drains the memtable and hands its keys to the segment writer
+                // verbatim, so the term dictionary holds
+                // "{database_id}:{tid}:{collection}:{term}" — and one segment
+                // can hold terms from several collections, so the scope cannot
+                // be dropped here either. Looking these up by the bare token
+                // found nothing, which made every spilled segment unsearchable.
+                let blocks = reader.read_postings(&scoped_term);
                 let mut postings = Vec::new();
                 for block in blocks {
                     for i in 0..block.doc_ids.len() {
@@ -176,7 +183,14 @@ mod tests {
     fn segment_only() {
         let backend = MemoryBackend::new();
         let mut postings = HashMap::new();
-        postings.insert("hello".to_string(), vec![cp(0, 1), cp(5, 2)]);
+        // Scoped, because that is what `flush_memtable` writes: it drains the
+        // memtable and hands its keys to the segment writer unchanged. A test
+        // that builds segments under bare terms tests a segment shape nothing
+        // produces, which is how the unreadable-spill bug survived.
+        postings.insert(
+            memtable_key(DB, T, "col", "hello"),
+            vec![cp(0, 1), cp(5, 2)],
+        );
         let seg_bytes = writer::flush_to_segment(postings).unwrap();
         backend
             .write_segment(DB, T, "col", "L0:0000000000000001", &seg_bytes)
@@ -196,7 +210,10 @@ mod tests {
         let backend = MemoryBackend::new();
 
         let mut seg_postings = HashMap::new();
-        seg_postings.insert("hello".to_string(), vec![cp(0, 1), cp(5, 2)]);
+        seg_postings.insert(
+            memtable_key(DB, T, "col", "hello"),
+            vec![cp(0, 1), cp(5, 2)],
+        );
         let seg_bytes = writer::flush_to_segment(seg_postings).unwrap();
         backend
             .write_segment(DB, T, "col", "L0:0000000000000001", &seg_bytes)
@@ -212,6 +229,50 @@ mod tests {
 
         assert_eq!(term_blocks.len(), 1);
         assert_eq!(term_blocks[0].df, 3);
+    }
+
+    /// A term that has been spilled out of the memtable must still be findable.
+    ///
+    /// Everything above builds its segments by hand, so none of it exercises
+    /// the path that actually produces them. This one indexes, spills, and then
+    /// searches — with an empty memtable afterwards, so a hit can only have come
+    /// from the segment. It is the case that was silently returning nothing.
+    #[test]
+    fn a_spilled_term_is_still_searchable() {
+        use crate::backend::memory::MemoryBackend;
+        use crate::index::FtsIndex;
+
+        let index = FtsIndex::new(MemoryBackend::new());
+        index
+            .index_document(
+                DB,
+                T,
+                "col",
+                nodedb_types::Surrogate(1),
+                "spilled term here",
+            )
+            .unwrap();
+        index.flush_memtable(DB, T, "col").unwrap();
+
+        // The stored term is stemmed; `collect_merged_term_blocks` takes query
+        // tokens that have already been through the same analysis.
+        let tokens = vec!["spill".to_string()];
+        let term_blocks = collect_merged_term_blocks(
+            index.backend(),
+            DB,
+            T,
+            "col",
+            index.memtable(),
+            &tokens,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(term_blocks.len(), 1);
+        assert_eq!(
+            term_blocks[0].df, 1,
+            "the spilled posting must be readable from the segment"
+        );
     }
 
     #[test]
