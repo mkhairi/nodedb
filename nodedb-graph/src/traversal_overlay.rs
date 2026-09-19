@@ -366,7 +366,7 @@ mod tests {
     /// sequence, nearest first.
     #[test]
     fn overlay_bfs_returns_a_stable_breadth_first_order() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         for b in 0..20 {
             csr.add_edge("root", "KNOWS", &format!("d{b}")).unwrap();
         }

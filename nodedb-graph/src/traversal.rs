@@ -550,7 +550,7 @@ mod tests {
     /// Builds a root with `branches` outgoing chains of 3 hops each. Wide
     /// enough that a hash-ordered result is virtually never in BFS order.
     fn make_star_of_chains(branches: usize) -> CsrIndex {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         for b in 0..branches {
             csr.add_edge("root", "L", &format!("b{b}h0")).unwrap();
             csr.add_edge(&format!("b{b}h0"), "L", &format!("b{b}h1"))
@@ -569,7 +569,13 @@ mod tests {
     fn bfs_with_depth_returns_a_stable_breadth_first_order() {
         let csr = make_star_of_chains(20);
         let run = || {
-            csr.traverse_bfs_with_depth(&["root"], Some("L"), Direction::Out, 3, DEFAULT_MAX_VISITED)
+            csr.traverse_bfs_with_depth(
+                &["root"],
+                Some("L"),
+                Direction::Out,
+                3,
+                DEFAULT_MAX_VISITED,
+            )
         };
 
         let first = run();
