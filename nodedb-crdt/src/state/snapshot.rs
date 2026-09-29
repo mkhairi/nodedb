@@ -149,10 +149,12 @@ impl CrdtState {
     ///
     /// Cheap enough to call on the write path. The underlying proxy is a
     /// snapshot export, which costs O(document), so it is used to calibrate a
-    /// bytes-per-operation ratio and the answer comes from the oplog's
-    /// operation counter — a real export runs only when the document has
-    /// halved or doubled since it was last measured. Exact for a document that
-    /// has not changed since then, an interpolation otherwise.
+    /// cost per operation and the answer comes from the oplog's operation
+    /// counter — a real export runs only when the operations written since
+    /// the model's base have halved or doubled since the last measurement. A
+    /// shallow document's base is its compacted state, so that state is not
+    /// priced per operation. Exact for a document that has not changed since
+    /// it was measured, an extrapolation otherwise.
     ///
     /// Compaction discards the measurement along with the document it
     /// described.
@@ -498,5 +500,129 @@ mod tests {
         let restored = CrdtState::new(2).expect("restored state");
         restored.import(&snapshot).expect("bounded snapshot import");
         assert!(restored.row_exists("docs", "row"));
+    }
+
+    /// A document large enough that its state dwarfs one small write: 3000 rows
+    /// of a 2000-character body, the shape that tripped the memory governor.
+    fn large_state() -> CrdtState {
+        let state = CrdtState::new(1).expect("state");
+        let body = "lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+            .repeat(36)
+            .chars()
+            .take(2_000)
+            .collect::<String>();
+        for i in 0..3_000 {
+            let body = format!("{i:06}{body}");
+            state
+                .upsert(
+                    "docs",
+                    &format!("d-{i}"),
+                    &[("body", LoroValue::String(body.into()))],
+                )
+                .expect("large write");
+            // The governor asks after every write, so the probe does too.
+            state.estimated_memory_bytes();
+        }
+        state
+    }
+
+    /// Apply `writes` tiny upserts, reading the estimate after each one as the
+    /// governor does. Returns `(write number, estimate, real snapshot bytes)`.
+    ///
+    /// The real size is taken after each of the first 24 writes, then every
+    /// 25th: a shallow export costs ~0.5 s in a debug build.
+    fn small_writes(state: &CrdtState, writes: usize) -> Vec<(usize, usize, usize)> {
+        (1..=writes)
+            .filter_map(|n| {
+                state
+                    .upsert(
+                        "small",
+                        &format!("s-{n}"),
+                        &[("v", LoroValue::I64(n as i64))],
+                    )
+                    .expect("small write");
+                let estimate = state.estimated_memory_bytes();
+                (n <= 24 || n % 25 == 0).then(|| {
+                    let real = state.export_snapshot().expect("snapshot").len();
+                    (n, estimate, real)
+                })
+            })
+            .collect()
+    }
+
+    /// A shallow document's operation count covers only what was written since
+    /// the shallow root, while its encoded size carries the whole state. Holding
+    /// bytes-per-operation fixed charged every small write the average cost of
+    /// the entire document, pushing the estimate towards 2x the truth until the
+    /// doubling rule re-measured it — and past the memory governor's emergency
+    /// threshold, where every write in the store is refused.
+    fn assert_tracks_real_size(label: &str, points: &[(usize, usize, usize)]) {
+        for &(n, estimate, real) in points {
+            let ratio = estimate as f64 / real as f64;
+            eprintln!(
+                "{label}: after {n} small write(s): est={estimate} real={real} ratio={ratio:.3}"
+            );
+            assert!(
+                (0.8..=1.25).contains(&ratio),
+                "{label}: after {n} small write(s) the estimate is {estimate} bytes against a \
+                 real {real} (ratio {ratio:.2}); a shallow document must not be charged its \
+                 whole state per operation"
+            );
+        }
+    }
+
+    #[test]
+    fn estimated_memory_tracks_a_compacted_document_under_small_writes() {
+        let mut state = large_state();
+        let before = state.estimated_memory_bytes();
+        eprintln!(
+            "before compact: est={before} real={}",
+            state.export_snapshot().expect("snapshot").len()
+        );
+
+        state.compact_history().expect("compact");
+        assert!(state.doc.is_shallow());
+        let after = state.estimated_memory_bytes();
+        assert_eq!(after, state.export_snapshot().expect("snapshot").len());
+        eprintln!("after compact: est={after}");
+
+        let points = small_writes(&state, 200);
+        assert_tracks_real_size("compacted", &points);
+
+        // Compaction swaps the document, which restarts the export counter: this
+        // counts only the exports made since. Logarithmic in 200 writes, not linear.
+        let exports = state.export_count_for_test();
+        eprintln!("exports since the swap: {exports}");
+        assert!(
+            exports <= 16,
+            "{exports} full exports for 200 writes after compaction — the estimate is \
+             re-encoding the document per write"
+        );
+    }
+
+    #[test]
+    fn estimated_memory_tracks_a_document_restored_from_a_shallow_snapshot() {
+        let mut source = large_state();
+        source.compact_history().expect("compact");
+        let shallow = source.export_snapshot().expect("shallow snapshot");
+
+        // Reopen as a store does: a fresh document fed the persisted snapshot.
+        // Nothing of the pre-compaction history exists in this process.
+        let restored = CrdtState::new(1).expect("restored state");
+        restored.estimated_memory_bytes();
+        restored.import_local(&shallow).expect("restore");
+        assert!(restored.doc.is_shallow());
+        assert_eq!(restored.estimated_memory_bytes(), shallow.len());
+
+        let points = small_writes(&restored, 200);
+        assert_tracks_real_size("restored", &points);
+
+        let exports = restored.export_count_for_test();
+        eprintln!("exports since the swap: {exports}");
+        assert!(
+            exports <= 16,
+            "{exports} full exports for 200 writes after a restore — the estimate is \
+             re-encoding the document per write"
+        );
     }
 }
