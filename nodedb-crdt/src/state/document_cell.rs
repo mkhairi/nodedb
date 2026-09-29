@@ -27,8 +27,10 @@ struct Measurement {
 ///
 /// So the model is `last.bytes + (ops - last.ops) * marginal`, where the
 /// marginal cost per operation is the growth from `base` to `last`. For a
-/// full-history document `base` is the empty document, which reduces this to
-/// the proportional ratio. For a shallow document `base` is its first
+/// full-history document `base` is the empty document. When that document was
+/// measured empty, its encoded header is the base, so the header is a fixed
+/// cost. Otherwise the base is zero bytes, which reduces this to the
+/// proportional ratio. For a shallow document `base` is its first
 /// measurement, so the state it started with is a fixed cost and only the
 /// operations written since are priced per operation.
 struct Calibration {
@@ -41,7 +43,7 @@ struct Calibration {
 
 impl Calibration {
     fn new(measured: Measurement, shallow: bool) -> Self {
-        let base = if shallow {
+        let base = if shallow || measured.ops == 0 {
             measured
         } else {
             Measurement { ops: 0, bytes: 0 }
@@ -53,41 +55,40 @@ impl Calibration {
         }
     }
 
-    /// Operations added since the base, or `None` below it.
-    fn grown(&self, ops: usize) -> Option<usize> {
-        ops.checked_sub(self.base.ops)
-    }
-
-    /// Encoded size implied by `ops`, extrapolating from the last measurement
-    /// at the marginal cost per operation measured since the base. Computed in
-    /// `i128` because a large document's `bytes * ops` overflows `usize` on
-    /// 32-bit targets long before either factor does.
-    fn estimate(&self, ops: usize) -> usize {
-        let span = (self.last.ops - self.base.ops) as i128;
-        // Encoded size can shrink as operations arrive, since deletes and
-        // overwrites drop state. A negative marginal is not a cost to project.
-        let growth = self.last.bytes.saturating_sub(self.base.bytes) as i128;
-        let delta = ops as i128 - self.last.ops as i128;
-        let estimate = self.last.bytes as i128 + delta.saturating_mul(growth) / span;
-        usize::try_from(estimate.max(0)).unwrap_or(usize::MAX)
-    }
-
-    /// Whether `ops` is close enough to the last measurement to extrapolate
-    /// from it. Encoded density is stable within a document — what changes it
-    /// is a different *kind* of content, which arrives gradually — so the
-    /// marginal is re-measured once the operations added since the base have
-    /// halved or doubled.
+    /// Encoded size implied by `ops`, or `None` when `ops` is too far from
+    /// the last measurement to extrapolate from it.
+    ///
+    /// The answer extrapolates from the last measurement at the marginal cost
+    /// per operation measured since the base. Encoded density is stable within
+    /// a document — what changes it is a different *kind* of content, which
+    /// arrives gradually — so the marginal is re-measured once the operations
+    /// added since the base have halved or doubled.
     ///
     /// Bounding recalibration to a doubling makes the export cost amortise to
     /// O(1) per write, rather than being paid on every write. Counting from
     /// the base rather than from zero keeps that true for a shallow document,
     /// whose count is small whatever its size.
-    fn covers(&self, ops: usize) -> bool {
-        let span = self.last.ops - self.base.ops;
-        let Some(grown) = self.grown(ops) else {
-            return false;
-        };
-        span > 0 && grown > 0 && grown <= span.saturating_mul(2) && grown.saturating_mul(2) >= span
+    fn extrapolate(&self, ops: usize) -> Option<usize> {
+        if ops == self.last.ops {
+            return Some(self.last.bytes);
+        }
+        let span = self.last.ops.checked_sub(self.base.ops)?;
+        let grown = ops.checked_sub(self.base.ops)?;
+        if span == 0
+            || grown == 0
+            || grown > span.saturating_mul(2)
+            || grown.saturating_mul(2) < span
+        {
+            return None;
+        }
+        // Encoded size can shrink as operations arrive, since deletes and
+        // overwrites drop state. A negative marginal is not a cost to project.
+        let growth = self.last.bytes.saturating_sub(self.base.bytes) as i128;
+        // `delta * growth` is computed in `i128`: on a 32-bit target it
+        // overflows `usize` long before either factor does.
+        let delta = ops as i128 - self.last.ops as i128;
+        let estimate = self.last.bytes as i128 + delta.saturating_mul(growth) / span as i128;
+        Some(usize::try_from(estimate.max(0)).unwrap_or(usize::MAX))
     }
 }
 
@@ -157,13 +158,13 @@ impl DocumentCell {
     /// an interpolation otherwise, which is what a pressure signal needs.
     pub(in crate::state) fn estimated_bytes(&self) -> usize {
         let ops = self.doc.len_ops();
-        if let Some(calibration) = self.calibration.borrow().as_ref() {
-            if ops == calibration.last.ops {
-                return calibration.last.bytes;
-            }
-            if calibration.covers(ops) {
-                return calibration.estimate(ops);
-            }
+        if let Some(estimate) = self
+            .calibration
+            .borrow()
+            .as_ref()
+            .and_then(|calibration| calibration.extrapolate(ops))
+        {
+            return estimate;
         }
 
         #[cfg(test)]
@@ -181,7 +182,7 @@ impl DocumentCell {
         let shallow = self.doc.is_shallow();
         let mut calibration = self.calibration.borrow_mut();
         match calibration.as_mut() {
-            Some(current) if current.shallow == shallow && current.grown(ops).is_some() => {
+            Some(current) if current.shallow == shallow && ops >= current.base.ops => {
                 current.last = measured;
             }
             _ => *calibration = Some(Calibration::new(measured, shallow)),

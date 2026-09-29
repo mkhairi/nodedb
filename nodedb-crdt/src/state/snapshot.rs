@@ -502,17 +502,24 @@ mod tests {
         assert!(restored.row_exists("docs", "row"));
     }
 
-    /// A document large enough that its state dwarfs one small write: 3000 rows
-    /// of a 2000-character body, the shape that tripped the memory governor.
+    /// A document large enough that its state dwarfs one small write: 1000 rows
+    /// of a 2000-character body. The body is pseudo-random, so it does not
+    /// compress away: the snapshot is about 4.1 MB, and about 2.1 MB once
+    /// compacted.
     fn large_state() -> CrdtState {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
         let state = CrdtState::new(1).expect("state");
-        let body = "lorem ipsum dolor sit amet, consectetur adipiscing elit. "
-            .repeat(36)
-            .chars()
-            .take(2_000)
-            .collect::<String>();
-        for i in 0..3_000 {
-            let body = format!("{i:06}{body}");
+        for i in 0..1_000 {
+            let body: String = (0..2_000)
+                .map(|_| {
+                    // xorshift64: deterministic, and incompressible enough.
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    ALPHABET[(seed % ALPHABET.len() as u64) as usize] as char
+                })
+                .collect();
             state
                 .upsert(
                     "docs",
@@ -529,8 +536,8 @@ mod tests {
     /// Apply `writes` tiny upserts, reading the estimate after each one as the
     /// governor does. Returns `(write number, estimate, real snapshot bytes)`.
     ///
-    /// The real size is taken after each of the first 24 writes, then every
-    /// 25th: a shallow export costs ~0.5 s in a debug build.
+    /// The real size is taken after each of the first 8 writes, then every
+    /// 25th: a shallow export is slow in a debug build.
     fn small_writes(state: &CrdtState, writes: usize) -> Vec<(usize, usize, usize)> {
         (1..=writes)
             .filter_map(|n| {
@@ -542,7 +549,7 @@ mod tests {
                     )
                     .expect("small write");
                 let estimate = state.estimated_memory_bytes();
-                (n <= 24 || n % 25 == 0).then(|| {
+                (n <= 8 || n % 25 == 0).then(|| {
                     let real = state.export_snapshot().expect("snapshot").len();
                     (n, estimate, real)
                 })
@@ -550,12 +557,8 @@ mod tests {
             .collect()
     }
 
-    /// A shallow document's operation count covers only what was written since
-    /// the shallow root, while its encoded size carries the whole state. Holding
-    /// bytes-per-operation fixed charged every small write the average cost of
-    /// the entire document, pushing the estimate towards 2x the truth until the
-    /// doubling rule re-measured it — and past the memory governor's emergency
-    /// threshold, where every write in the store is refused.
+    /// Asserts every sampled estimate is within `0.8..=1.25` of the real
+    /// snapshot size.
     fn assert_tracks_real_size(label: &str, points: &[(usize, usize, usize)]) {
         for &(n, estimate, real) in points {
             let ratio = estimate as f64 / real as f64;
@@ -571,6 +574,29 @@ mod tests {
         }
     }
 
+    /// Asserts the export count stays logarithmic in 200 writes, not linear.
+    fn assert_few_exports(label: &str, state: &CrdtState) {
+        let exports = state.export_count_for_test();
+        eprintln!("{label}: exports since the swap: {exports}");
+        assert!(
+            exports <= 16,
+            "{label}: {exports} full exports for 200 writes — the estimate is \
+             re-encoding the document per write"
+        );
+    }
+
+    /// A shallow snapshot as a compacted store persists it.
+    fn shallow_snapshot() -> Vec<u8> {
+        let mut source = large_state();
+        source.compact_history().expect("compact");
+        source.export_snapshot().expect("shallow snapshot")
+    }
+
+    // A shallow document's operation count covers only what was written since
+    // the shallow root, while its encoded size carries the whole state. Holding
+    // bytes-per-operation fixed charged every small write the average cost of
+    // the entire document — 1.67x the truth after two writes — and past the
+    // memory governor's emergency threshold every write in the store is refused.
     #[test]
     fn estimated_memory_tracks_a_compacted_document_under_small_writes() {
         let mut state = large_state();
@@ -588,26 +614,32 @@ mod tests {
 
         let points = small_writes(&state, 200);
         assert_tracks_real_size("compacted", &points);
-
-        // Compaction swaps the document, which restarts the export counter: this
-        // counts only the exports made since. Logarithmic in 200 writes, not linear.
-        let exports = state.export_count_for_test();
-        eprintln!("exports since the swap: {exports}");
-        assert!(
-            exports <= 16,
-            "{exports} full exports for 200 writes after compaction — the estimate is \
-             re-encoding the document per write"
-        );
+        // Compaction swaps the document, which restarts the export counter.
+        assert_few_exports("compacted", &state);
     }
 
     #[test]
     fn estimated_memory_tracks_a_document_restored_from_a_shallow_snapshot() {
-        let mut source = large_state();
-        source.compact_history().expect("compact");
-        let shallow = source.export_snapshot().expect("shallow snapshot");
+        let shallow = shallow_snapshot();
 
-        // Reopen as a store does: a fresh document fed the persisted snapshot.
-        // Nothing of the pre-compaction history exists in this process.
+        // The real open path: `from_local_snapshot`, with nothing measured
+        // before the import. No pre-compaction history exists in this process.
+        let restored = CrdtState::from_local_snapshot(1, &shallow).expect("restore");
+        assert!(restored.doc.is_shallow());
+        assert_eq!(restored.estimated_memory_bytes(), shallow.len());
+
+        let points = small_writes(&restored, 200);
+        assert_tracks_real_size("restored", &points);
+        assert_few_exports("restored", &restored);
+    }
+
+    #[test]
+    fn estimated_memory_rebases_when_an_empty_document_turns_shallow() {
+        let shallow = shallow_snapshot();
+
+        // Measuring the empty document first caches a full-history model. The
+        // import makes the document shallow, and the model must rebase on it
+        // rather than keep pricing from the empty document.
         let restored = CrdtState::new(1).expect("restored state");
         restored.estimated_memory_bytes();
         restored.import_local(&shallow).expect("restore");
@@ -615,14 +647,7 @@ mod tests {
         assert_eq!(restored.estimated_memory_bytes(), shallow.len());
 
         let points = small_writes(&restored, 200);
-        assert_tracks_real_size("restored", &points);
-
-        let exports = restored.export_count_for_test();
-        eprintln!("exports since the swap: {exports}");
-        assert!(
-            exports <= 16,
-            "{exports} full exports for 200 writes after a restore — the estimate is \
-             re-encoding the document per write"
-        );
+        assert_tracks_real_size("rebased", &points);
+        assert_few_exports("rebased", &restored);
     }
 }
