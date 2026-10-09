@@ -55,6 +55,10 @@ fn admit_starts(
 }
 
 /// String-keyed BFS that merges the transaction's staged edges/tombstones.
+///
+/// Nodes are returned in BFS discovery order: the start nodes first, then each
+/// level in name order. The order is stable across identical calls, so a
+/// caller taking a bounded prefix gets the nearest nodes.
 pub(crate) fn traverse_bfs_overlay(
     partition: Option<&CsrIndex>,
     params: BfsParams<'_>,
@@ -71,6 +75,9 @@ pub(crate) fn traverse_bfs_overlay(
     let durable_labels = partition.map(|csr| csr.label_filter(label_filter));
     let mut visited: HashSet<String> = HashSet::new();
     let mut frontier = admit_starts(partition, overlay, start_nodes, &mut visited);
+    // Discovery order of `visited`, kept alongside it because a HashSet
+    // iterates in per-instance seed order.
+    let mut order = frontier.clone();
 
     let want_out = matches!(direction, Direction::Out | Direction::Both);
     let want_in = matches!(direction, Direction::In | Direction::Both);
@@ -139,9 +146,10 @@ pub(crate) fn traverse_bfs_overlay(
             }
         }
         frontier = admit_names(candidates, &mut visited, max_visited);
+        order.extend(frontier.iter().cloned());
     }
 
-    visited.into_iter().collect()
+    order
 }
 
 /// The arguments of one overlay subgraph walk.

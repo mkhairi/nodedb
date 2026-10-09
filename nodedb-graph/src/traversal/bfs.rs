@@ -15,6 +15,10 @@ use crate::traversal_overlay::traverse_bfs_overlay;
 impl CsrIndex {
     /// BFS traversal. Returns all reachable node IDs within max_depth hops.
     ///
+    /// Nodes are returned in BFS discovery order: the start nodes first, then
+    /// each level in name order. The order is stable across identical calls, so
+    /// a caller taking a bounded prefix gets the nearest nodes.
+    ///
     /// `max_visited` caps the number of nodes visited to prevent supernode fan-out
     /// explosion. Pass [`crate::traversal::DEFAULT_MAX_VISITED`] for the standard limit.
     ///
@@ -72,12 +76,16 @@ impl CsrIndex {
             })
         };
         let mut visited: HashSet<u32> = HashSet::new();
+        // Discovery order of `visited`, kept alongside it because a HashSet
+        // iterates in per-instance seed order.
+        let mut order: Vec<u32> = Vec::new();
         let mut frontier: Vec<u32> = Vec::new();
         for &node in start_nodes {
             if let Some(&id) = self.node_to_id.get(node)
                 && visited.insert(id)
             {
                 frontier.push(id);
+                order.push(id);
             }
         }
 
@@ -88,9 +96,10 @@ impl CsrIndex {
             let candidates =
                 self.level_candidates(&frontier, &labels, direction, &visited, in_bitmap);
             frontier = self.admit_by_name(candidates, &mut visited, max_visited);
+            order.extend(frontier.iter().copied());
         }
 
-        visited
+        order
             .into_iter()
             .map(|id| self.id_to_node[id as usize].clone())
             .collect()
@@ -365,6 +374,72 @@ mod tests {
         );
         result.sort();
         assert_eq!(result, vec!["a", "b", "m"]);
+    }
+
+    /// Builds a root with `branches` outgoing chains of 3 hops each. Wide
+    /// enough that a hash-ordered result is virtually never in BFS order.
+    fn make_star_of_chains(branches: usize) -> CsrIndex {
+        let mut csr = CsrIndex::new(test_memory());
+        for b in 0..branches {
+            csr.add_edge("root", "L", &format!("b{b}h0")).unwrap();
+            csr.add_edge(&format!("b{b}h0"), "L", &format!("b{b}h1"))
+                .unwrap();
+            csr.add_edge(&format!("b{b}h1"), "L", &format!("b{b}h2"))
+                .unwrap();
+        }
+        csr
+    }
+
+    /// Repeated identical walks return the identical sequence, and it is
+    /// breadth-first: depth-1 nodes all precede depth-2 nodes.
+    #[test]
+    fn bfs_returns_a_stable_breadth_first_order() {
+        let csr = make_star_of_chains(20);
+        let run = || {
+            csr.traverse_bfs(
+                BfsParams {
+                    start_nodes: &["root"],
+                    label_filter: &["L"],
+                    direction: Direction::Out,
+                    max_depth: 3,
+                    max_visited: DEFAULT_MAX_VISITED,
+                    frontier_bitmap: None,
+                },
+                None,
+            )
+        };
+
+        let first = run();
+        assert_eq!(first.len(), 61);
+        for i in 1..8 {
+            assert_eq!(run(), first, "traversal {i} returned a different order");
+        }
+
+        assert_eq!(first[0], "root");
+        let last_h0 = first.iter().rposition(|n| n.ends_with("h0")).unwrap();
+        let first_h1 = first.iter().position(|n| n.ends_with("h1")).unwrap();
+        assert!(last_h0 < first_h1, "result is not breadth-first: {first:?}");
+    }
+
+    /// The depth-tagged walk is stable and its depths never decrease.
+    #[test]
+    fn bfs_with_depth_returns_a_stable_breadth_first_order() {
+        let csr = make_star_of_chains(20);
+        let run = || {
+            csr.traverse_bfs_with_depth(&["root"], &["L"], Direction::Out, 3, DEFAULT_MAX_VISITED)
+        };
+
+        let first = run();
+        assert_eq!(first.len(), 61);
+        for i in 1..8 {
+            assert_eq!(run(), first, "traversal {i} returned a different order");
+        }
+
+        assert_eq!(first[0], ("root".to_string(), 0));
+        assert!(
+            first.windows(2).all(|w| w[0].1 <= w[1].1),
+            "result is not breadth-first: {first:?}"
+        );
     }
 
     #[test]
