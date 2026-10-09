@@ -26,6 +26,9 @@ pub(crate) struct ScopeState {
     /// the smallfloat array lossy (space-efficient for ranking) while
     /// making corpus-stat accounting exact.
     pub(super) fieldnorms_exact: Vec<u32>,
+    /// Bytes of resident postings and term keys, as [`posting_bytes`] and
+    /// [`term_bytes`] count them.
+    pub(super) bytes: usize,
 }
 
 /// Postings and terms a mutation removed from one index.
@@ -33,18 +36,35 @@ pub(crate) struct ScopeState {
 pub(crate) struct Removed {
     pub(crate) postings: usize,
     pub(crate) terms: usize,
+    /// Resident bytes the removed postings and terms held.
+    pub(crate) bytes: usize,
+}
+
+/// Bytes one posting costs. Positions are the only heap allocation per
+/// posting, so they are counted. The struct itself is counted by size.
+// ponytail: HashMap slack and allocator overhead are not counted. Count them if
+// the governor still reads low against measured heap.
+pub(crate) fn posting_bytes(posting: &CompactPosting) -> usize {
+    std::mem::size_of::<CompactPosting>() + posting.positions.len() * std::mem::size_of::<u32>()
+}
+
+/// Bytes one term key costs: the key string and its posting-vector header.
+pub(crate) fn term_bytes(term: &str) -> usize {
+    term.len() + std::mem::size_of::<String>() + std::mem::size_of::<Vec<CompactPosting>>()
 }
 
 impl ScopeState {
     /// Insert a posting for a term. Returns whether the term is new here.
     pub(super) fn insert(&mut self, term: &str, posting: CompactPosting) -> bool {
         self.total_postings += 1;
+        self.bytes += posting_bytes(&posting);
         match self.postings.get_mut(term) {
             Some(list) => {
                 list.push(posting);
                 false
             }
             None => {
+                self.bytes += term_bytes(term);
                 self.postings.insert(term.to_string(), vec![posting]);
                 true
             }
@@ -70,9 +90,16 @@ impl ScopeState {
     /// Remove a document's postings from every term of this index.
     pub(super) fn remove_doc(&mut self, doc_id: Surrogate) -> Removed {
         let mut removed = Removed::default();
-        self.postings.retain(|_, postings| {
+        self.postings.retain(|term, postings| {
             let before = postings.len();
-            postings.retain(|p| p.doc_id != doc_id);
+            postings.retain(|p| {
+                if p.doc_id == doc_id {
+                    removed.bytes += posting_bytes(p);
+                    false
+                } else {
+                    true
+                }
+            });
             removed.postings += before - postings.len();
             if postings.len() < before
                 && !postings.is_empty()
@@ -83,10 +110,12 @@ impl ScopeState {
             let keep = !postings.is_empty();
             if !keep {
                 removed.terms += 1;
+                removed.bytes += term_bytes(term);
             }
             keep
         });
         self.total_postings -= removed.postings;
+        self.bytes = self.bytes.saturating_sub(removed.bytes);
 
         // Decrement stats using the exact-length sidecar so the subtraction
         // matches the exact-length increment in record_doc. Using the
@@ -112,6 +141,7 @@ impl ScopeState {
         Removed {
             postings: self.total_postings,
             terms: self.postings.len(),
+            bytes: self.bytes,
         }
     }
 }
