@@ -13,6 +13,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+use nodedb_mem::{ReservationToken, ScopedMemory};
 use nodedb_types::Surrogate;
 
 use super::config::MemtableConfig;
@@ -24,6 +25,10 @@ use crate::scope::IndexScope;
 type CollectionScopes = HashMap<String, HashMap<String, ScopeState>>;
 /// `(database_id, tid)` → that tenant's indexes.
 type ScopeMap = HashMap<(u64, u64), CollectionScopes>;
+
+/// Resident bytes are charged to the governor in steps of this size, so a
+/// posting insert does not touch the governor's counters every time.
+const CHARGE_STEP: usize = 1024 * 1024;
 
 /// One index the memtable holds state for.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -54,6 +59,15 @@ pub struct Memtable {
     total_terms: Cell<usize>,
     /// Spill configuration.
     config: MemtableConfig,
+    /// Governor handle for resident-posting accounting. `None` leaves them
+    /// uncounted.
+    memory: Option<ScopedMemory>,
+    /// Bytes of resident postings and term keys across every index.
+    tracked: Cell<usize>,
+    /// Bytes last charged to the governor.
+    charged: Cell<usize>,
+    /// Holds the `charged` bytes. Dropping it releases them.
+    charge: RefCell<Option<ReservationToken>>,
 }
 
 impl Memtable {
@@ -63,7 +77,27 @@ impl Memtable {
             total_postings: Cell::new(0),
             total_terms: Cell::new(0),
             config,
+            memory: None,
+            tracked: Cell::new(0),
+            charged: Cell::new(0),
+            charge: RefCell::new(None),
         }
+    }
+
+    /// Memtable whose resident postings are charged to `memory`.
+    // NDB-WORKAROUND(NDB-AQL-48): resident postings are counted against the
+    // FTS engine budget. The memtable is the only place postings live, so an
+    // insert from any path (live, restore) is counted once.
+    pub fn with_memory(config: MemtableConfig, memory: ScopedMemory) -> Self {
+        Self {
+            memory: Some(memory),
+            ..Self::new(config)
+        }
+    }
+
+    /// Bytes of resident postings and term keys across every index.
+    pub fn resident_bytes(&self) -> usize {
+        self.tracked.get()
     }
 
     /// Insert a posting for a term of one index.
@@ -77,8 +111,11 @@ impl Memtable {
     ) {
         let mut scopes = self.scopes.borrow_mut();
         let state = state_entry(&mut scopes, database_id, tid, index);
+        let before = state.bytes;
         let new_term = state.insert(term, posting);
-        self.add(1, usize::from(new_term));
+        let bytes = state.bytes - before;
+        drop(scopes);
+        self.add(1, usize::from(new_term), bytes);
     }
 
     /// Insert every posting of one document and record its length, in one
@@ -94,13 +131,16 @@ impl Memtable {
     ) {
         let mut scopes = self.scopes.borrow_mut();
         let state = state_entry(&mut scopes, database_id, tid, index);
+        let before = state.bytes;
         let (mut added, mut new_terms) = (0usize, 0usize);
         for (term, posting) in postings {
             added += 1;
             new_terms += usize::from(state.insert(term, posting));
         }
         state.record_doc(doc_id, doc_len);
-        self.add(added, new_terms);
+        let bytes = state.bytes - before;
+        drop(scopes);
+        self.add(added, new_terms, bytes);
     }
 
     /// Record a document's stats in one index (call once per indexed document).
@@ -288,10 +328,12 @@ impl Memtable {
             .map(f)
     }
 
-    fn add(&self, postings: usize, terms: usize) {
+    fn add(&self, postings: usize, terms: usize, bytes: usize) {
         self.total_postings
             .set(self.total_postings.get() + postings);
         self.total_terms.set(self.total_terms.get() + terms);
+        self.tracked.set(self.tracked.get() + bytes);
+        self.sync_charge();
     }
 
     fn subtract(&self, removed: Removed) {
@@ -299,6 +341,26 @@ impl Memtable {
             .set(self.total_postings.get().saturating_sub(removed.postings));
         self.total_terms
             .set(self.total_terms.get().saturating_sub(removed.terms));
+        self.tracked
+            .set(self.tracked.get().saturating_sub(removed.bytes));
+        self.sync_charge();
+    }
+
+    /// Move the governor charge to the tracked bytes once they drift by a
+    /// step, or on any change that empties the memtable. The old token is
+    /// dropped before the new charge is taken, so a pressure check during the
+    /// swap sees the old bytes once and never twice.
+    fn sync_charge(&self) {
+        let Some(memory) = &self.memory else {
+            return;
+        };
+        let tracked = self.tracked.get();
+        if tracked != 0 && tracked.abs_diff(self.charged.get()) < CHARGE_STEP {
+            return;
+        }
+        drop(self.charge.borrow_mut().take());
+        *self.charge.borrow_mut() = Some(memory.charge(tracked));
+        self.charged.set(tracked);
     }
 }
 
@@ -394,6 +456,63 @@ mod tests {
                 Surrogate(term + 1)
             );
         }
+    }
+
+    #[test]
+    fn resident_postings_are_charged_to_the_governor() {
+        let gov = crate::test_support::test_governor();
+        let mt = Memtable::with_memory(
+            MemtableConfig::default(),
+            crate::mem_scope::fts_scope(&gov, 0, 0),
+        );
+        let n = 100_000;
+        for doc in 0..n {
+            mt.insert(DB, T, S, "hello", make_posting(doc, 1));
+        }
+        // Charges lag tracked bytes by less than one step, and never exceed them.
+        let expected = n as usize * (std::mem::size_of::<CompactPosting>() + 4);
+        let charged = gov.total_allocated();
+        assert!(
+            charged + CHARGE_STEP >= expected,
+            "charged {charged} B, expected at least {expected} B"
+        );
+        assert!(
+            charged <= expected + 1024,
+            "charged {charged} B, more than the {expected} B of postings"
+        );
+        mt.drain_scope(DB, T, S);
+        assert_eq!(mt.resident_bytes(), 0);
+        assert_eq!(gov.total_allocated(), 0, "drain releases every charge");
+    }
+
+    /// Every path that removes postings releases their bytes: remove_doc,
+    /// drain_collection, and drain_tenant.
+    #[test]
+    fn every_removal_path_releases_tracked_bytes() {
+        let gov = crate::test_support::test_governor();
+        let mt = Memtable::with_memory(
+            MemtableConfig::default(),
+            crate::mem_scope::fts_scope(&gov, 0, 0),
+        );
+        let other = IndexScope::document("other");
+        mt.insert_doc(
+            DB,
+            T,
+            S,
+            Surrogate(1),
+            2,
+            [("alpha", make_posting(1, 1)), ("bravo", make_posting(1, 1))],
+        );
+        mt.insert(DB, T, other, "alpha", make_posting(2, 1));
+        mt.insert(DB, T + 1, S, "alpha", make_posting(3, 1));
+        assert!(mt.resident_bytes() > 0);
+
+        mt.remove_doc(DB, T, S, Surrogate(1));
+        mt.drain_collection(DB, T, "other");
+        mt.drain_tenant(DB, T + 1);
+        assert!(mt.is_empty());
+        assert_eq!(mt.resident_bytes(), 0);
+        assert_eq!(gov.total_allocated(), 0);
     }
 
     #[test]
