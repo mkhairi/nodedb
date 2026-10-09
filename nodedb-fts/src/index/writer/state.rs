@@ -32,13 +32,22 @@ pub struct FtsIndex<B: FtsBackend> {
     pub(crate) governor: Arc<MemoryGovernor>,
 }
 
+/// A memtable whose resident postings are charged to `governor`.
+///
+/// The scope is `(0, 0)`. Lite is single-database and single-tenant, so this
+/// is exact there. In a multi-tenant nodedb every posting counts against
+/// tenant 0.
+fn accounted_memtable(config: MemtableConfig, governor: &Arc<MemoryGovernor>) -> Memtable {
+    Memtable::with_memory(config, crate::mem_scope::fts_scope(governor, 0, 0))
+}
+
 impl<B: FtsBackend> FtsIndex<B> {
     /// Create a new FTS index with the given backend, default BM25 params, and a memory governor.
     pub fn new(backend: B, governor: Arc<MemoryGovernor>) -> Self {
         Self {
             backend,
             bm25_params: Bm25Params::default(),
-            memtable: Memtable::new(MemtableConfig::default()),
+            memtable: accounted_memtable(MemtableConfig::default(), &governor),
             next_segment_id: AtomicU64::new(1),
             governor,
         }
@@ -60,7 +69,7 @@ impl<B: FtsBackend> FtsIndex<B> {
         governor: Arc<MemoryGovernor>,
     ) -> Self {
         Self {
-            memtable: Memtable::new(memtable),
+            memtable: accounted_memtable(memtable, &governor),
             ..Self::new(backend, governor)
         }
     }
@@ -75,7 +84,7 @@ impl<B: FtsBackend> FtsIndex<B> {
     ) -> Self {
         Self {
             bm25_params: params,
-            memtable: Memtable::new(memtable),
+            memtable: accounted_memtable(memtable, &governor),
             ..Self::new(backend, governor)
         }
     }
