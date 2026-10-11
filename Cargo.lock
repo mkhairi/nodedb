@@ -4509,6 +4509,7 @@ version = "0.5.0"
 dependencies = [
  "arc-swap",
  "crc32c",
+ "hashbrown 0.16.1",
  "icu_segmenter",
  "lindera",
  "nodedb-mem",

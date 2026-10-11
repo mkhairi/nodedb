@@ -192,16 +192,14 @@ impl Memtable {
         index: IndexScope<'_>,
         term: &str,
     ) -> Vec<CompactPosting> {
-        self.read(database_id, tid, index, |s| {
-            s.postings.get(term).cloned().unwrap_or_default()
-        })
-        .unwrap_or_default()
+        self.read(database_id, tid, index, |s| s.postings(term).to_vec())
+            .unwrap_or_default()
     }
 
     /// Get all term names of one index.
     pub fn terms(&self, database_id: u64, tid: u64, index: IndexScope<'_>) -> Vec<String> {
         self.read(database_id, tid, index, |s| {
-            s.postings.keys().cloned().collect()
+            s.iter().map(|(term, _)| term.to_string()).collect()
         })
         .unwrap_or_default()
     }
@@ -218,16 +216,17 @@ impl Memtable {
             .unwrap_or_default()
     }
 
-    /// Run `f` over one index's term→postings map without removing it.
-    /// `None` when the memtable holds no state for the index.
+    /// Run `f` over one index's terms and their postings, in no particular
+    /// order, without removing them. `None` when the memtable holds no state
+    /// for the index.
     pub fn with_scope_postings<R>(
         &self,
         database_id: u64,
         tid: u64,
         index: IndexScope<'_>,
-        f: impl FnOnce(&HashMap<String, Vec<CompactPosting>>) -> R,
+        f: impl for<'s> FnOnce(&mut dyn Iterator<Item = (&'s str, &'s [CompactPosting])>) -> R,
     ) -> Option<R> {
-        self.read(database_id, tid, index, |s| f(&s.postings))
+        self.read(database_id, tid, index, |s| f(&mut s.iter()))
     }
 
     /// Every index the memtable holds state for.
@@ -269,7 +268,7 @@ impl Memtable {
         prune_empty(&mut scopes, database_id, tid, index.collection());
         drop(scopes);
         self.subtract(state.footprint());
-        state.postings
+        state.into_postings()
     }
 
     /// Drop every index of one collection.
@@ -436,9 +435,8 @@ mod tests {
                 mt.remove_doc(DB, T, S, Surrogate(terms + mover + 1));
                 let capacities_ok = mt
                     .read(DB, T, S, |s| {
-                        s.postings.values().all(|postings| {
-                            postings.capacity() <= postings.len().saturating_mul(2).max(4)
-                        })
+                        s.posting_capacities()
+                            .all(|(len, capacity)| capacity <= len.saturating_mul(2).max(4))
                     })
                     .unwrap_or(true);
                 assert!(capacities_ok);
@@ -470,7 +468,14 @@ mod tests {
             mt.insert(DB, T, S, "hello", make_posting(doc, 1));
         }
         // Charges lag tracked bytes by less than one step, and never exceed them.
-        let expected = n as usize * (std::mem::size_of::<CompactPosting>() + 4);
+        // Each posting: the struct, one position, and its term id in the
+        // document's term list. Each document here holds one posting, so each
+        // also carries one term-list entry.
+        let expected = n as usize
+            * (std::mem::size_of::<CompactPosting>()
+                + 4
+                + 4
+                + std::mem::size_of::<(Surrogate, Vec<u32>)>());
         let charged = gov.total_allocated();
         assert!(
             charged + CHARGE_STEP >= expected,

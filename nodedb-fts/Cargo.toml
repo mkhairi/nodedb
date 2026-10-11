@@ -27,6 +27,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 crc32c = { workspace = true }
 arc-swap = { workspace = true }
+hashbrown = { workspace = true }
 
 # Dictionary-based CJK segmentation (always compiled in; selected at runtime)
 # lang-zh falls back to CJK bigrams — the previous dictionary chain pulled
