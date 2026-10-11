@@ -41,7 +41,11 @@ impl<B: FtsBackend> FtsIndex<B> {
         let segment = self
             .memtable
             .with_scope_postings(database_id, tid, index, |postings| {
-                (!postings.is_empty()).then(|| seg_writer::flush_postings_to_segment(postings))
+                let mut postings = postings.peekable();
+                postings
+                    .peek()
+                    .is_some()
+                    .then(|| seg_writer::flush_postings_to_segment(postings))
             })
             .flatten();
         let Some(segment_bytes) = segment else {
