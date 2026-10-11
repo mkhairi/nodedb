@@ -20,16 +20,20 @@ use super::format::{self, TermDictEntry};
 pub fn flush_to_segment(
     term_postings: HashMap<String, Vec<CompactPosting>>,
 ) -> Result<Vec<u8>, SegmentError> {
-    flush_postings_to_segment(&term_postings)
+    flush_postings_to_segment(
+        term_postings
+            .iter()
+            .map(|(term, postings)| (term.as_str(), postings.as_slice())),
+    )
 }
 
-/// Build a segment from a borrowed term→postings map. The map stays intact,
-/// so a caller can drop it only after the segment is durably written.
-pub fn flush_postings_to_segment(
-    term_postings: &HashMap<String, Vec<CompactPosting>>,
+/// Build a segment from borrowed terms and postings. They stay intact, so a
+/// caller can drop them only after the segment is durably written.
+pub fn flush_postings_to_segment<'a>(
+    term_postings: impl IntoIterator<Item = (&'a str, &'a [CompactPosting])>,
 ) -> Result<Vec<u8>, SegmentError> {
     // Sort terms for binary-searchable term dictionary.
-    let mut sorted_terms: Vec<(&String, &Vec<CompactPosting>)> = term_postings.iter().collect();
+    let mut sorted_terms: Vec<(&str, &[CompactPosting])> = term_postings.into_iter().collect();
     sorted_terms.sort_by_key(|(term, _)| *term);
 
     // Phase 1: Encode posting blocks for each term, collect byte offsets.

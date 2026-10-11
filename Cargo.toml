@@ -195,6 +195,7 @@ rkyv = { version = "0.8", features = ["alloc"] }
 
 # Atomic pointer swap for non-blocking index cutover
 arc-swap = "1"
+hashbrown = { version = "0.16", default-features = false }
 
 # Safe transmutation for f32/u8 slice casts
 bytemuck = { version = "1", features = ["derive"] }
