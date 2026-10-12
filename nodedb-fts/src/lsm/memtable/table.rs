@@ -158,6 +158,18 @@ impl Memtable {
 
     /// Remove a document's postings from every term of one index.
     pub fn remove_doc(&self, database_id: u64, tid: u64, index: IndexScope<'_>, doc_id: Surrogate) {
+        self.remove_docs(database_id, tid, index, &[doc_id]);
+    }
+
+    /// Remove several documents' postings from one index, visiting each
+    /// touched term once.
+    pub fn remove_docs(
+        &self,
+        database_id: u64,
+        tid: u64,
+        index: IndexScope<'_>,
+        doc_ids: &[Surrogate],
+    ) {
         let mut scopes = self.scopes.borrow_mut();
         let Some(fields) = scopes
             .get_mut(&(database_id, tid))
@@ -168,7 +180,7 @@ impl Memtable {
         let Some(state) = fields.get_mut(index.field_key()) else {
             return;
         };
-        let removed = state.remove_doc(doc_id);
+        let removed = state.remove_docs(doc_ids);
         if state.is_vacant() {
             fields.remove(index.field_key());
         }

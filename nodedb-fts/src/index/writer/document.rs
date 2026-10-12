@@ -131,17 +131,40 @@ impl<B: FtsBackend> FtsIndex<B> {
         index: impl Into<IndexScope<'a>>,
         doc_id: Surrogate,
     ) -> Result<(), FtsIndexError<B::Error>> {
+        self.remove_documents(database_id, tid, index, &[doc_id])
+    }
+
+    /// Remove several documents from one index, as [`Self::remove_document`]
+    /// does for each. The memtable visits each touched term once, and the
+    /// segment delete sets are loaded and stored once.
+    pub fn remove_documents<'a>(
+        &self,
+        database_id: u64,
+        tid: u64,
+        index: impl Into<IndexScope<'a>>,
+        doc_ids: &[Surrogate],
+    ) -> Result<(), FtsIndexError<B::Error>> {
         let index = index.into();
-        let doc_len = self
-            .backend
-            .read_doc_length(database_id, tid, index, doc_id)
-            .map_err(FtsIndexError::backend)?;
+        // A document listed twice must lose its length from the stats once.
+        let mut doc_ids = doc_ids.to_vec();
+        doc_ids.sort_unstable();
+        doc_ids.dedup();
+        let mut held = Vec::new();
+        for &doc_id in &doc_ids {
+            if let Some(len) = self
+                .backend
+                .read_doc_length(database_id, tid, index, doc_id)
+                .map_err(FtsIndexError::backend)?
+            {
+                held.push((doc_id, len));
+            }
+        }
 
-        self.memtable.remove_doc(database_id, tid, index, doc_id);
+        self.memtable.remove_docs(database_id, tid, index, &doc_ids);
 
-        let Some(len) = doc_len else {
+        if held.is_empty() {
             return Ok(());
-        };
+        }
         let segments = self
             .backend
             .list_segments(database_id, tid, index)
@@ -149,15 +172,19 @@ impl<B: FtsBackend> FtsIndex<B> {
         if !segments.is_empty() {
             let mut deletes =
                 SegmentDeletes::load(&self.backend, database_id, tid, index, &segments)?;
-            deletes.mark_removed(&segments, doc_id);
+            for &(doc_id, _) in &held {
+                deletes.mark_removed(&segments, doc_id);
+            }
             deletes.store(&self.backend, database_id, tid, index)?;
         }
-        self.backend
-            .remove_doc_length(database_id, tid, index, doc_id)
-            .map_err(FtsIndexError::backend)?;
-        self.backend
-            .decrement_stats(database_id, tid, index, len)
-            .map_err(FtsIndexError::backend)?;
+        for (doc_id, len) in held {
+            self.backend
+                .remove_doc_length(database_id, tid, index, doc_id)
+                .map_err(FtsIndexError::backend)?;
+            self.backend
+                .decrement_stats(database_id, tid, index, len)
+                .map_err(FtsIndexError::backend)?;
+        }
 
         Ok(())
     }
@@ -223,6 +250,49 @@ mod tests {
 
         let (count, _) = idx.backend.collection_stats(DB, T, DOCS).unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// Documents in a segment and in the memtable, one listed twice and one
+    /// never indexed: removed together, the index ends as if each were
+    /// removed alone.
+    #[test]
+    fn removing_documents_together_matches_removing_each() {
+        let build = || {
+            let idx = make_index();
+            idx.index_document(DB, T, "docs", Surrogate(1), "rust tokio")
+                .unwrap();
+            idx.index_document(DB, T, "docs", Surrogate(2), "rust axum")
+                .unwrap();
+            idx.flush_memtable(DB, T, "docs").unwrap();
+            idx.index_document(DB, T, "docs", Surrogate(3), "rust serde")
+                .unwrap();
+            idx.index_document(DB, T, "docs", Surrogate(4), "rust tower")
+                .unwrap();
+            idx
+        };
+        let each = build();
+        each.remove_document(DB, T, "docs", Surrogate(1)).unwrap();
+        each.remove_document(DB, T, "docs", Surrogate(3)).unwrap();
+        let together = build();
+        together
+            .remove_documents(
+                DB,
+                T,
+                "docs",
+                &[Surrogate(3), Surrogate(1), Surrogate(3), Surrogate(9)],
+            )
+            .unwrap();
+
+        assert_eq!(hits(&together, "rust"), vec![2, 4]);
+        assert_eq!(hits(&together, "rust"), hits(&each, "rust"));
+        assert_eq!(
+            together.backend.collection_stats(DB, T, DOCS).unwrap(),
+            each.backend.collection_stats(DB, T, DOCS).unwrap()
+        );
+        assert_eq!(
+            together.memtable.stats(DB, T, DOCS),
+            each.memtable.stats(DB, T, DOCS)
+        );
     }
 
     fn hits(idx: &FtsIndex<MemoryBackend>, query: &str) -> Vec<u32> {
