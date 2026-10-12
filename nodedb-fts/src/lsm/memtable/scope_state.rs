@@ -2,8 +2,8 @@
 
 //! Memtable state of one index: its postings and its corpus stats.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
 
 use hashbrown::HashTable;
@@ -116,10 +116,9 @@ impl ScopeState {
                     }
                 };
                 let (terms, hasher) = (&self.terms, &self.hasher);
-                self.lookup
-                    .insert_unique(hasher.hash_one(term), id, |&id| {
-                        hasher.hash_one(&*terms[id as usize].text)
-                    });
+                self.lookup.insert_unique(hasher.hash_one(term), id, |&id| {
+                    hasher.hash_one(&*terms[id as usize].text)
+                });
                 (id, true)
             }
         };
@@ -151,41 +150,68 @@ impl ScopeState {
     }
 
     /// Remove a document's postings from the terms it is indexed under.
+    #[cfg(test)]
     pub(super) fn remove_doc(&mut self, doc_id: Surrogate) -> Removed {
+        self.remove_docs(&[doc_id])
+    }
+
+    /// Remove several documents' postings, visiting each touched term once.
+    ///
+    /// A term shared by most documents holds a posting list as long as the
+    /// index, so removing documents one at a time scans that list once per
+    /// document.
+    pub(super) fn remove_docs(&mut self, docs: &[Surrogate]) -> Removed {
+        match docs {
+            [doc] => self.remove_matching(docs, |d| d == *doc),
+            _ => {
+                let set: HashSet<Surrogate> = docs.iter().copied().collect();
+                self.remove_matching(docs, |d| set.contains(&d))
+            }
+        }
+    }
+
+    /// Remove the postings of `docs`. `removing` answers whether a posting's
+    /// document is one of them.
+    fn remove_matching(
+        &mut self,
+        docs: &[Surrogate],
+        removing: impl Fn(Surrogate) -> bool,
+    ) -> Removed {
         let mut removed = Removed::default();
-        if let Some(ids) = self.doc_terms.remove(&doc_id) {
-            removed.bytes += doc_bytes();
-            for id in ids {
-                let slot = &mut self.terms[id as usize];
-                let before = slot.postings.len();
-                // A term listed twice for this document was emptied on its
-                // first visit.
-                if before == 0 {
-                    continue;
+        let mut touched = Vec::new();
+        for doc_id in docs {
+            if let Some(ids) = self.doc_terms.remove(doc_id) {
+                removed.bytes += doc_bytes();
+                touched.extend(ids);
+            }
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        for id in touched {
+            let slot = &mut self.terms[id as usize];
+            let before = slot.postings.len();
+            slot.postings.retain(|p| {
+                if removing(p.doc_id) {
+                    removed.bytes += posting_bytes(p);
+                    false
+                } else {
+                    true
                 }
-                slot.postings.retain(|p| {
-                    if p.doc_id == doc_id {
-                        removed.bytes += posting_bytes(p);
-                        false
-                    } else {
-                        true
-                    }
-                });
-                removed.postings += before - slot.postings.len();
-                if slot.postings.is_empty() {
-                    removed.terms += 1;
-                    removed.bytes += term_bytes(&slot.text);
-                    let freed = std::mem::take(slot);
-                    let hash = self.hasher.hash_one(&*freed.text);
-                    if let Ok(entry) = self.lookup.find_entry(hash, |&x| x == id) {
-                        entry.remove();
-                    }
-                    self.free.push(id);
-                } else if slot.postings.len() < before
-                    && slot.postings.capacity() > slot.postings.len().saturating_mul(2).max(4)
-                {
-                    slot.postings.shrink_to(slot.postings.len());
+            });
+            removed.postings += before - slot.postings.len();
+            if slot.postings.is_empty() {
+                removed.terms += 1;
+                removed.bytes += term_bytes(&slot.text);
+                let freed = std::mem::take(slot);
+                let hash = self.hasher.hash_one(&*freed.text);
+                if let Ok(entry) = self.lookup.find_entry(hash, |&x| x == id) {
+                    entry.remove();
                 }
+                self.free.push(id);
+            } else if slot.postings.len() < before
+                && slot.postings.capacity() > slot.postings.len().saturating_mul(2).max(4)
+            {
+                slot.postings.shrink_to(slot.postings.len());
             }
         }
         self.total_postings -= removed.postings;
@@ -194,13 +220,15 @@ impl ScopeState {
         // Decrement stats using the exact-length sidecar so the subtraction
         // matches the exact-length increment in record_doc. Using the
         // smallfloat-decoded length here would drift upward on churn.
-        if let Some(slot) = self.fieldnorms_exact.get_mut(doc_id.0 as usize)
-            && *slot > 0
-        {
-            let doc_len = *slot;
-            *slot = 0;
-            self.stats.0 = self.stats.0.saturating_sub(1);
-            self.stats.1 = self.stats.1.saturating_sub(doc_len as u64);
+        for doc_id in docs {
+            if let Some(slot) = self.fieldnorms_exact.get_mut(doc_id.0 as usize)
+                && *slot > 0
+            {
+                let doc_len = *slot;
+                *slot = 0;
+                self.stats.0 = self.stats.0.saturating_sub(1);
+                self.stats.1 = self.stats.1.saturating_sub(doc_len as u64);
+            }
         }
         removed
     }
@@ -285,7 +313,10 @@ mod tests {
         index(&mut fresh, 1, &["alpha", "beta", "gamma"]);
         index(&mut fresh, 3, &["gamma", "delta", "omega"]);
         assert_eq!(removed.postings, 2);
-        assert_eq!(removed.terms, 0, "beta and delta are still held by docs 1 and 3");
+        assert_eq!(
+            removed.terms, 0,
+            "beta and delta are still held by docs 1 and 3"
+        );
         assert_eq!(state.total_postings, fresh.total_postings);
         assert_eq!(state.stats, fresh.stats);
         assert_eq!(state.bytes, fresh.bytes);
@@ -324,5 +355,58 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(elapsed.as_secs() < 2, "1,000 removals took {elapsed:?}");
         assert_eq!(state.total_postings, 100_000);
+    }
+
+    #[test]
+    fn removing_docs_together_matches_removing_them_one_at_a_time() {
+        let build = || {
+            let mut state = ScopeState::default();
+            index(&mut state, 1, &["common", "alpha"]);
+            index(&mut state, 2, &["common", "beta"]);
+            index(&mut state, 3, &["common", "gamma"]);
+            index(&mut state, 4, &["common", "alpha", "delta"]);
+            state
+        };
+        let mut one_by_one = build();
+        one_by_one.remove_doc(Surrogate(1));
+        one_by_one.remove_doc(Surrogate(4));
+        let mut together = build();
+        // Listed twice and listed but never indexed: both change nothing more.
+        let removed =
+            together.remove_docs(&[Surrogate(1), Surrogate(4), Surrogate(4), Surrogate(9)]);
+
+        assert_eq!(removed.postings, 5);
+        assert_eq!(removed.terms, 2, "alpha and delta are held by no one else");
+        assert_eq!(together.total_postings, one_by_one.total_postings);
+        assert_eq!(together.stats, one_by_one.stats);
+        assert_eq!(together.bytes, one_by_one.bytes);
+        assert_eq!(together.footprint(), one_by_one.footprint());
+        for term in ["common", "alpha", "beta", "gamma", "delta"] {
+            let docs: Vec<u32> = together.postings(term).iter().map(|p| p.doc_id.0).collect();
+            let want: Vec<u32> = one_by_one
+                .postings(term)
+                .iter()
+                .map(|p| p.doc_id.0)
+                .collect();
+            assert_eq!(docs, want, "{term}");
+        }
+    }
+
+    #[test]
+    fn removing_many_docs_scans_a_shared_term_once() {
+        let mut state = ScopeState::default();
+        for doc in 1..=50_000 {
+            state.insert("shared", posting(doc));
+        }
+        let docs: Vec<Surrogate> = (1..=25_000).map(Surrogate).collect();
+        let started = std::time::Instant::now();
+        state.remove_docs(&docs);
+        // One document at a time scans the shared list 25,000 times.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed.as_secs() < 2,
+            "removing 25,000 docs took {elapsed:?}"
+        );
+        assert_eq!(state.postings("shared").len(), 25_000);
     }
 }
