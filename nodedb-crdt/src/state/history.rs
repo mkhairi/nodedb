@@ -17,6 +17,13 @@ impl CrdtState {
         self.doc.oplog_vv()
     }
 
+    /// Per peer, the operations a shallow snapshot discarded: the document
+    /// holds only the operations of [`oplog_version_vector`](Self::oplog_version_vector)
+    /// above this. Empty for a document that holds its full history.
+    pub fn shallow_since_version_vector(&self) -> loro::VersionVector {
+        self.doc.shallow_since_vv().to_vv()
+    }
+
     /// Read the document state at a historical version.
     ///
     /// Forks a private copy at the target version and reads the specified
