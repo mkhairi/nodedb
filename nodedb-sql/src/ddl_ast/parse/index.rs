@@ -31,10 +31,15 @@ fn parse<'a>(sql: &'a str, toks: &[Token<'a>]) -> Result<CollectionStmt, SqlErro
     }
     if c.eat_keywords(&["DROP", "INDEX"]) {
         let (if_exists, name) = if_exists_name(&mut c, "index name")?;
+        let collection = if c.eat_keyword("ON") {
+            Some(c.ident("collection")?)
+        } else {
+            None
+        };
         c.finish()?;
         return Ok(CollectionStmt::DropIndex {
             name,
-            collection: None,
+            collection,
             if_exists,
         });
     }

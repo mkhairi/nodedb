@@ -315,6 +315,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_drop_index_on_collection() {
+        let stmt = ok("DROP INDEX idx_name ON coll");
+        match stmt {
+            NodedbStatement::Collection(CollectionStmt::DropIndex {
+                name,
+                collection,
+                if_exists,
+            }) => {
+                assert_eq!(name, "idx_name");
+                assert_eq!(collection.as_deref(), Some("coll"));
+                assert!(!if_exists);
+            }
+            other => panic!("expected DropIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_analyze() {
         assert_eq!(
             parse("ANALYZE users"),
